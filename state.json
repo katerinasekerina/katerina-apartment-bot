@@ -1,0 +1,16 @@
+{
+  "initialized": false,
+  "seen": {
+    "myhome_rent": [],
+    "myhome_sale": [],
+    "ss_rent": [],
+    "ss_sale": []
+  },
+  "max_ids": {
+    "myhome_rent": 0,
+    "myhome_sale": 0,
+    "ss_rent": 0,
+    "ss_sale": 0
+  },
+  "heartbeat_week": ""
+}
