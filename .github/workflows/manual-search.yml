@@ -1,0 +1,42 @@
+name: Manual apartment search
+
+on:
+  workflow_dispatch:
+    inputs:
+      district:
+        description: District to search
+        required: true
+        type: choice
+        options:
+          - gldani
+          - didi_digomi
+          - digomi
+          - nadzaladevi
+          - isani
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manual-apartment-search-${{ inputs.district }}
+  cancel-in-progress: false
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    container: mcr.microsoft.com/playwright/python:v1.62.0-noble
+
+    steps:
+      - name: Download project
+        uses: actions/checkout@v4
+
+      - name: Install Python package
+        run: python -m pip install --no-cache-dir -r requirements-cloud.txt
+
+      - name: Search selected district and notify Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MANUAL_DISTRICT: ${{ inputs.district }}
+          MANUAL_LIMIT: "10"
+        run: python check_once.py
