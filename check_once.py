@@ -154,12 +154,15 @@ def extract_location(text: str) -> str:
 
 def extract_address(text: str, location: str) -> str:
     patterns = (
-        r"([A-Za-zА-Яа-яЁёႠ-ჿ0-9 .()'’/-]{2,80}"
-        r"(?:st\.?|street|ave\.?|avenue|road|rd\.?|highway))",
-        r"([A-Za-zА-Яа-яЁёႠ-ჿ0-9 .()'’/-]{2,80}"
-        r"(?:ქუჩა|გამზირი|ჩიხი|გზატკეცილი))",
-        r"((?:ул\.?|улица|проспект)\s*"
-        r"[A-Za-zА-Яа-яЁёႠ-ჿ0-9 .()'’/-]{2,80})",
+        r"((?:[A-Za-zА-Яа-яЁёႠ-ჿ0-9][A-Za-zА-Яа-яЁёႠ-ჿ0-9.'’()/-]*\s+)"
+        r"{1,7}(?:st|street|ave|avenue|road|rd|highway)\.?)"
+        r"(?![A-Za-z])",
+        r"((?:[A-Za-zА-Яа-яЁёႠ-ჿ0-9][A-Za-zА-Яа-яЁёႠ-ჿ0-9.'’()/-]*\s+)"
+        r"{1,7}(?:ქ\.|ქუჩა|გამზირი|ჩიხი|გზატკეცილი))"
+        r"(?![Ⴀ-ჿ])",
+        r"((?:ул(?:ица)?|проспект|пр-т)\.?\s+"
+        r"[A-Za-zА-Яа-яЁёႠ-ჿ][A-Za-zА-Яа-яЁёႠ-ჿ.'’()/-]*"
+        r"(?:\s+[A-Za-zА-Яа-яЁёႠ-ჿ][A-Za-zА-Яа-яЁёႠ-ჿ.'’()/-]*){0,5})",
     )
 
     for pattern in patterns:
@@ -191,7 +194,18 @@ def extract_address(text: str, location: str) -> str:
                 "",
                 address,
             )
-            return address[:100]
+            address = normalize_text(address).strip(" -|,.;")
+
+            if re.search(
+                r"real estate|publish|log in|login|advertisement|"
+                r"разместить|авторизац|реклама|განცხადების დამატება",
+                address,
+                re.IGNORECASE,
+            ):
+                continue
+
+            if 2 <= len(address) <= 100 and len(address.split()) <= 9:
+                return address
 
     return location
 
@@ -326,7 +340,123 @@ async def collect_page_links(page: Any) -> list[dict[str, str]]:
     )
 
 
-async def capture_listing_photo(page: Any) -> bytes:
+def is_property_photo_url(url: str) -> bool:
+    lowered = urllib.parse.unquote(url or "").lower()
+
+    if not lowered.startswith(("http://", "https://")):
+        return False
+
+    if re.search(
+        r"logo|icon|avatar|profile|owner|flag|badge|banner|advert|"
+        r"adline|roaming|promo|campaign|googleplay|appstore|qr|sprite|favicon",
+        lowered,
+    ):
+        return False
+
+    host = urllib.parse.urlsplit(lowered).netloc
+
+    if host.endswith("static.ss.ge"):
+        return bool(
+            re.search(r"/20\d{6}/", lowered)
+            and re.search(r"\.(?:jpe?g|png|webp)(?:\?|$)", lowered)
+        )
+
+    if host.endswith("static.my.ge"):
+        return bool(
+            re.search(r"\.(?:jpe?g|png|webp)(?:\?|$)", lowered)
+        )
+
+    return False
+
+
+async def screenshot_image_url(context: Any, image_url: str) -> bytes | None:
+    if not is_property_photo_url(image_url):
+        return None
+
+    image_page = await context.new_page()
+
+    try:
+        await image_page.goto(
+            image_url,
+            wait_until="load",
+            timeout=45_000,
+        )
+        image = image_page.locator("img").first
+        await image.wait_for(state="visible", timeout=15_000)
+        photo = await image.screenshot(
+            type="jpeg",
+            quality=86,
+            animations="disabled",
+            timeout=20_000,
+        )
+
+        if 2_000 <= len(photo) <= 9_500_000:
+            return photo
+    except Exception:
+        return None
+    finally:
+        await image_page.close()
+
+    return None
+
+
+async def placeholder_photo(context: Any) -> bytes:
+    placeholder = await context.new_page()
+
+    try:
+        await placeholder.set_viewport_size({"width": 900, "height": 560})
+        await placeholder.set_content(
+            """
+            <style>
+              html, body {
+                margin: 0;
+                width: 900px;
+                height: 560px;
+                background: #1f2633;
+                color: #ffffff;
+                font-family: Arial, sans-serif;
+              }
+              main {
+                width: 900px;
+                height: 560px;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+              }
+              .icon { font-size: 110px; }
+              .text { margin-top: 25px; font-size: 42px; font-weight: 700; }
+              .sub { margin-top: 14px; font-size: 25px; color: #c9d1dc; }
+            </style>
+            <main>
+              <div class="icon">🏠</div>
+              <div class="text">ФОТО НЕДОСТУПНО</div>
+              <div class="sub">Откройте объявление для просмотра</div>
+            </main>
+            """,
+            wait_until="load",
+        )
+        return await placeholder.screenshot(
+            type="jpeg",
+            quality=86,
+            full_page=False,
+        )
+    finally:
+        await placeholder.close()
+
+
+async def capture_listing_photo(
+    page: Any,
+    preferred_url: str = "",
+) -> bytes:
+    preferred_photo = await screenshot_image_url(
+        page.context,
+        preferred_url,
+    )
+
+    if preferred_photo:
+        return preferred_photo
+
     image_data = await page.evaluate(
         r"""
         () => {
@@ -340,144 +470,89 @@ async def capture_listing_photo(page: Any) -> bytes:
             }
           };
 
-          const blocked = /logo|icon|avatar|user|profile|flag|badge/i;
-          let best = null;
+          const blocked = /logo|icon|avatar|profile|owner|flag|badge|banner|advert|adline|roaming|promo|campaign|googleplay|appstore|qr|sprite|favicon/i;
+          const candidates = [];
 
-          Array.from(document.images).forEach((image, index) => {
-            const source =
-              image.currentSrc ||
-              image.src ||
-              image.getAttribute('data-src') ||
-              image.getAttribute('data-lazy-src') ||
-              image.getAttribute('data-original') ||
-              '';
+          const addCandidate = (value, index, width, height, hint) => {
+            const source = absoluteUrl(value);
 
-            const width = Math.max(
-              image.naturalWidth || 0,
-              image.getBoundingClientRect().width || 0
-            );
-            const height = Math.max(
-              image.naturalHeight || 0,
-              image.getBoundingClientRect().height || 0
-            );
-
-            if (
-              width < 280 ||
-              height < 160 ||
-              blocked.test(`${source} ${image.alt || ''}`)
-            ) {
+            if (!source || blocked.test(`${source} ${hint || ''}`)) {
               return;
             }
 
-            const score = width * height;
+            const lowered = source.toLowerCase();
+            let score = Math.min((width || 0) * (height || 0), 600000);
 
-            if (!best || score > best.score) {
-              best = {
-                index,
-                source: absoluteUrl(source),
-                score
-              };
+            if (/static\.ss\.ge\/20\d{6}\//i.test(lowered)) {
+              score += 3000000;
+            } else if (/static\.my\.ge/i.test(lowered)) {
+              score += 2000000;
+            } else {
+              return;
+            }
+
+            if (/_thumb\.(?:jpe?g|png|webp)/i.test(lowered)) {
+              score += 400000;
+            }
+
+            if (/photo|image|gallery|swiper/i.test(hint || '')) {
+              score += 250000;
+            }
+
+            candidates.push({source, index, score});
+          };
+
+          Array.from(document.images).forEach((image, index) => {
+            const rect = image.getBoundingClientRect();
+            const width = Math.max(image.naturalWidth || 0, rect.width || 0);
+            const height = Math.max(image.naturalHeight || 0, rect.height || 0);
+            const hint = `${image.alt || ''} ${image.className || ''}`;
+            const sources = [
+              image.currentSrc,
+              image.src,
+              image.getAttribute('data-src'),
+              image.getAttribute('data-lazy-src'),
+              image.getAttribute('data-original')
+            ];
+
+            const srcset =
+              image.getAttribute('srcset') ||
+              image.closest('picture')?.querySelector('source')?.srcset ||
+              '';
+
+            for (const entry of srcset.split(',')) {
+              sources.push(entry.trim().split(/\s+/)[0]);
+            }
+
+            for (const source of sources) {
+              addCandidate(source, index, width, height, hint);
             }
           });
 
-          const metaSource = absoluteUrl(
-            document.querySelector(
-              'meta[property="og:image"], meta[name="twitter:image"]'
-            )?.content || ''
-          );
-
-          if (best) {
-            return {
-              index: best.index,
-              source: best.source || metaSource
-            };
+          for (const selector of [
+            'meta[property="og:image"]',
+            'meta[name="twitter:image"]'
+          ]) {
+            const meta = document.querySelector(selector);
+            addCandidate(meta?.content || '', null, 0, 0, selector);
           }
 
-          let background = '';
-          let backgroundScore = 0;
-
-          for (const element of document.querySelectorAll('main *, article *')) {
-            const rect = element.getBoundingClientRect();
-
-            if (rect.width < 280 || rect.height < 160) {
-              continue;
-            }
-
-            const value = getComputedStyle(element).backgroundImage;
-            const match = value && value.match(/url\(["']?(.*?)["']?\)/i);
-
-            if (!match || blocked.test(match[1])) {
-              continue;
-            }
-
-            const score = rect.width * rect.height;
-
-            if (score > backgroundScore) {
-              background = absoluteUrl(match[1]);
-              backgroundScore = score;
-            }
-          }
-
-          return {
-            index: null,
-            source: background || metaSource
-          };
+          candidates.sort((a, b) => b.score - a.score);
+          return candidates[0] || {source: '', index: null, score: 0};
         }
         """
     )
 
-    image_index = image_data.get("index")
-
-    if image_index is not None:
-        try:
-            image = page.locator("img").nth(int(image_index))
-            await image.scroll_into_view_if_needed(timeout=10_000)
-            photo = await image.screenshot(
-                type="jpeg",
-                quality=84,
-                animations="disabled",
-                timeout=20_000,
-            )
-
-            if len(photo) >= 2_000:
-                return photo
-        except Exception:
-            pass
-
     image_url = str(image_data.get("source") or "").strip()
-
-    if image_url.startswith(("http://", "https://")):
-        image_page = await page.context.new_page()
-
-        try:
-            await image_page.goto(
-                image_url,
-                wait_until="load",
-                timeout=45_000,
-            )
-            image = image_page.locator("img").first
-            await image.wait_for(state="visible", timeout=15_000)
-            photo = await image.screenshot(
-                type="jpeg",
-                quality=84,
-                animations="disabled",
-                timeout=20_000,
-            )
-
-            if len(photo) >= 2_000:
-                return photo
-        except Exception:
-            pass
-        finally:
-            await image_page.close()
-
-    # Last-resort preview: the notification still has an image even when
-    # the source listing has no accessible photograph.
-    return await page.screenshot(
-        type="jpeg",
-        quality=78,
-        full_page=False,
+    selected_photo = await screenshot_image_url(
+        page.context,
+        image_url,
     )
+
+    if selected_photo:
+        return selected_photo
+
+    return await placeholder_photo(page.context)
 
 
 async def enrich_new_listings(items: list[dict[str, Any]]) -> None:
@@ -519,24 +594,10 @@ async def enrich_new_listings(items: list[dict[str, Any]]) -> None:
                     timeout=75_000,
                 )
                 await page.wait_for_timeout(3_000)
-
-                try:
-                    detail_text = normalize_text(
-                        await page.locator("body").inner_text(
-                            timeout=15_000
-                        )
-                    )
-                    detail_address = extract_address(
-                        detail_text,
-                        item["location"],
-                    )
-
-                    if detail_address != item["location"]:
-                        item["address"] = detail_address
-                except Exception:
-                    pass
-
-                item["photo_bytes"] = await capture_listing_photo(page)
+                item["photo_bytes"] = await capture_listing_photo(
+                    page,
+                    str(item.get("image") or ""),
+                )
 
             except Exception as exc:
                 print(
@@ -901,10 +962,13 @@ def format_listing(item: dict[str, Any]) -> str:
         quote=True,
     )
     safe_location = html.escape(item["location"])
-    safe_address = html.escape(
-        item.get("address") or item["location"]
-    )
+    address = normalize_text(str(item.get("address") or ""))
+    safe_address = html.escape(address)
     safe_price = html.escape(item["price"])
+    address_line = ""
+
+    if address and address.casefold() != item["location"].casefold():
+        address_line = f"📌 <b>Адрес:</b> {safe_address}\n"
 
     return (
         "🏠 <b>НОВОЕ ОБЪЯВЛЕНИЕ</b>\n\n"
@@ -913,8 +977,8 @@ def format_listing(item: dict[str, Any]) -> str:
         "🔑 <b>Тип:</b> Аренда\n"
         f"📍 <b>Район:</b> "
         f"{safe_location}\n"
-        f"📌 <b>Адрес и цена:</b> "
-        f"{safe_address} — {safe_price}\n"
+        f"{address_line}"
+        f"💰 <b>Цена:</b> {safe_price}\n"
         f"🚪 <b>Комнат:</b> {item['rooms']}\n"
         f"📐 <b>Площадь:</b> "
         f"{html.escape(item['area'])}\n"
