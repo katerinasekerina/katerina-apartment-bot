@@ -63,9 +63,51 @@ def extract_room_count(text: str, url: str) -> int | None:
     return None
 
 
-def extract_price(text: str) -> str:
+def extract_price(text: str, usd_rate: float) -> str:
     match = re.search(r"(?<!\d)(\d[\d ,.]*?)\s*(₾|\$|€)", text)
-    return normalize_text("".join(match.groups())) if match else "—"
+
+    if not match:
+        return "—"
+
+    amount_text, currency = match.groups()
+    compact = re.sub(r"[\s,]", "", amount_text)
+
+    try:
+        amount = float(compact)
+    except ValueError:
+        return "—"
+
+    if currency == "₾":
+        amount /= usd_rate
+    elif currency == "€":
+        return "—"
+
+    rounded = int(round(amount))
+    return f"{rounded:,} $"
+
+
+def get_usd_rate() -> float:
+    url = (
+        "https://nbg.gov.ge/gw/api/ct/monetarypolicy/"
+        "currencies/en/json/?currencies=USD"
+    )
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = json.load(response)
+
+    for day in payload:
+        for currency in day.get("currencies", []):
+            if currency.get("code") == "USD":
+                rate = float(currency["rate"])
+
+                if rate > 0:
+                    return rate
+
+    raise RuntimeError("USD rate was not returned by NBG")
 
 
 def extract_area(text: str) -> str:
@@ -198,6 +240,8 @@ async def collect_page_links(page: Any) -> list[dict[str, str]]:
 async def scrape_all_sources():
     found: dict[tuple[str, str], dict[str, Any]] = {}
     errors: list[str] = []
+    usd_rate = get_usd_rate()
+    print(f"USD/GEL rate: {usd_rate}")
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
@@ -301,7 +345,7 @@ async def scrape_all_sources():
                             "listing_id": listing_id,
                             "url": url,
                             "rooms": rooms,
-                            "price": extract_price(text),
+                            "price": extract_price(text, usd_rate),
                             "area": extract_area(text),
                             "location": extract_location(text),
                             "summary": text[:700],
