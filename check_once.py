@@ -19,7 +19,7 @@ STATE_PATH = Path(__file__).resolve().parent / "state.json"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 MANUAL_DISTRICT = os.getenv("MANUAL_DISTRICT", "").strip().lower()
-MANUAL_LIMIT = max(1, min(20, int(os.getenv("MANUAL_LIMIT", "10"))))
+MANUAL_LIMIT = max(1, min(30, int(os.getenv("MANUAL_LIMIT", "30"))))
 
 DISTRICTS = {
     "gldani": {
