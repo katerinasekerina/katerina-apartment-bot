@@ -32,18 +32,6 @@ SOURCES = [
         ),
     },
     {
-        "key": "myhome_sale",
-        "site": "MyHome.ge",
-        "deal": "sale",
-        "rooms": {1, 2, 3},
-        "pages": 5,
-        "url": (
-            "https://www.myhome.ge/en/real-estate/sale/apartment/tbilisi/vake/1-room/"
-            "?deal_types=1&real_estate_types=1&cities=1&urbans=38,47&districts=4"
-            "&currency_id=1&CardView=1&owner_type=physical&room_types=1,2,3&page=1"
-        ),
-    },
-    {
         "key": "ss_rent",
         "site": "SS.ge",
         "deal": "rent",
@@ -51,18 +39,6 @@ SOURCES = [
         "pages": 10,
         "url": (
             "https://home.ss.ge/en/real-estate/l/Flat/For-Rent?cityIdList=95"
-            "&subdistrictIds=3%2C47&currencyId=1"
-            "&advancedSearch=%7B%22individualEntityOnly%22%3Atrue%7D"
-        ),
-    },
-    {
-        "key": "ss_sale",
-        "site": "SS.ge",
-        "deal": "sale",
-        "rooms": {1, 2, 3},
-        "pages": 10,
-        "url": (
-            "https://home.ss.ge/en/real-estate/l/Flat/For-Sale?cityIdList=95"
             "&subdistrictIds=3%2C47&currencyId=1"
             "&advancedSearch=%7B%22individualEntityOnly%22%3Atrue%7D"
         ),
@@ -414,7 +390,7 @@ def send_telegram(text: str) -> None:
             "chat_id": CHAT_ID,
             "text": text,
             "parse_mode": "HTML",
-            "disable_web_page_preview": "false",
+            "disable_web_page_preview": "true",
         }
     ).encode("utf-8")
 
@@ -435,29 +411,27 @@ def send_telegram(text: str) -> None:
 
 
 def format_listing(item: dict[str, Any]) -> str:
-    deal = (
-        "Аренда"
-        if item["deal"] == "rent"
-        else "Продажа"
-    )
-
     safe_url = html.escape(
         item["url"],
         quote=True,
     )
+    safe_location = html.escape(item["location"])
+    safe_price = html.escape(item["price"])
 
     return (
         "🏠 <b>НОВОЕ ОБЪЯВЛЕНИЕ</b>\n\n"
         f"🌐 <b>Сайт:</b> "
         f"{html.escape(item['site'])}\n"
-        f"🔑 <b>Тип:</b> {deal}\n"
+        "🔑 <b>Тип:</b> Аренда\n"
         f"📍 <b>Район:</b> "
-        f"{html.escape(item['location'])}\n"
+        f"{safe_location}\n"
         f"🚪 <b>Комнат:</b> {item['rooms']}\n"
         f"📐 <b>Площадь:</b> "
         f"{html.escape(item['area'])}\n"
         f"💰 <b>Цена:</b> "
-        f"{html.escape(item['price'])}\n\n"
+        f"{safe_price}\n"
+        f"🔎 <b>Поиск:</b> {safe_location} {safe_price} | "
+        f"{safe_price} {safe_location}\n\n"
         f"🔗 <a href=\"{safe_url}\">"
         f"Открыть объявление</a>"
     )
