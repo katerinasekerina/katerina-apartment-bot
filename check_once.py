@@ -18,6 +18,47 @@ from playwright.async_api import async_playwright
 STATE_PATH = Path(__file__).resolve().parent / "state.json"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+MANUAL_DISTRICT = os.getenv("MANUAL_DISTRICT", "").strip().lower()
+MANUAL_LIMIT = max(1, min(20, int(os.getenv("MANUAL_LIMIT", "10"))))
+
+DISTRICTS = {
+    "gldani": {
+        "label_ru": "Глдани",
+        "myhome_slug": "gldani",
+        "ss_subdistrict_id": 33,
+        "aliases": ("gldani", "გლდანი", "глдани"),
+    },
+    "didi_digomi": {
+        "label_ru": "Диди Дигоми",
+        "myhome_slug": "didi-dighomi",
+        "ss_subdistrict_id": 45,
+        "aliases": ("didi digomi", "დიდი დიღომი", "диди дигоми"),
+    },
+    "digomi": {
+        "label_ru": "Дигоми",
+        "myhome_slug": "dighmis-masivi",
+        "ss_subdistrict_id": 28,
+        "aliases": (
+            "digomi",
+            "dighmis masivi",
+            "დიღომი",
+            "დიღმის მასივი",
+            "дигоми",
+        ),
+    },
+    "nadzaladevi": {
+        "label_ru": "Надзаладеви",
+        "myhome_slug": "nadzaladevi",
+        "ss_subdistrict_id": 41,
+        "aliases": ("nadzaladevi", "ნაძალადევი", "надзаладеви"),
+    },
+    "isani": {
+        "label_ru": "Исани",
+        "myhome_slug": "isani",
+        "ss_subdistrict_id": 10,
+        "aliases": ("isani", "ისანი", "исани"),
+    },
+}
 
 SOURCES = [
     {
@@ -120,8 +161,19 @@ def extract_area(text: str) -> str:
     return f"{match.group(1)} m²" if match else "—"
 
 
-def is_target_location(text: str, url: str) -> bool:
-    combined = f"{text} {url}".lower()
+def is_target_location(
+    text: str,
+    url: str,
+    source: dict[str, Any] | None = None,
+) -> bool:
+    combined = urllib.parse.unquote(f"{text} {url}").lower()
+
+    if source and source.get("district_aliases"):
+        return any(
+            str(name).lower() in combined
+            for name in source["district_aliases"]
+        )
+
     return any(
         name in combined
         for name in (
@@ -135,7 +187,13 @@ def is_target_location(text: str, url: str) -> bool:
     )
 
 
-def extract_location(text: str) -> str:
+def extract_location(
+    text: str,
+    source: dict[str, Any] | None = None,
+) -> str:
+    if source and source.get("district_label"):
+        return str(source["district_label"])
+
     lowered = text.lower()
     locations = []
 
@@ -150,6 +208,64 @@ def extract_location(text: str) -> str:
         locations.append("Сабуртало")
 
     return " / ".join(locations) if locations else "Ваке / Сабуртало"
+
+
+def manual_sources_for_district(
+    district_key: str,
+) -> list[dict[str, Any]]:
+    config = DISTRICTS[district_key]
+    myhome_query = urllib.parse.urlencode(
+        {
+            "deal_types": "2",
+            "real_estate_types": "1",
+            "cities": "1",
+            "currency_id": "1",
+            "CardView": "1",
+            "owner_type": "physical",
+            "room_types": "1,2",
+            "page": "1",
+        }
+    )
+    ss_query = urllib.parse.urlencode(
+        {
+            "cityIdList": "95",
+            "subdistrictIds": str(config["ss_subdistrict_id"]),
+            "currencyId": "1",
+            "advancedSearch": json.dumps(
+                {"individualEntityOnly": True},
+                separators=(",", ":"),
+            ),
+        }
+    )
+    shared = {
+        "deal": "rent",
+        "rooms": {1, 2},
+        "pages": 3,
+        "district_aliases": config["aliases"],
+        "district_label": config["label_ru"],
+        "manual_search": True,
+    }
+
+    return [
+        {
+            **shared,
+            "key": f"manual_myhome_{district_key}",
+            "site": "MyHome.ge",
+            "url": (
+                "https://www.myhome.ge/en/real-estate/rent/apartment/"
+                f"tbilisi/{config['myhome_slug']}/?{myhome_query}"
+            ),
+        },
+        {
+            **shared,
+            "key": f"manual_ss_{district_key}",
+            "site": "SS.ge",
+            "url": (
+                "https://home.ss.ge/en/real-estate/l/Flat/For-Rent?"
+                f"{ss_query}"
+            ),
+        },
+    ]
 
 
 def extract_address(text: str, location: str) -> str:
@@ -611,7 +727,9 @@ async def enrich_new_listings(items: list[dict[str, Any]]) -> None:
         await browser.close()
 
 
-async def scrape_all_sources():
+async def scrape_all_sources(
+    sources: list[dict[str, Any]] | None = None,
+):
     found: dict[tuple[str, str], dict[str, Any]] = {}
     errors: list[str] = []
     usd_rate = get_usd_rate()
@@ -646,7 +764,7 @@ async def scrape_all_sources():
             "{get: () => undefined})"
         )
 
-        for source in SOURCES:
+        for source in (sources or SOURCES):
             page_count = int(source.get("pages", 1))
 
             for page_number in range(1, page_count + 1):
@@ -688,7 +806,7 @@ async def scrape_all_sources():
 
                         text = normalize_text(candidate["text"])
 
-                        if not is_target_location(text, url):
+                        if not is_target_location(text, url, source):
                             continue
 
                         rooms = extract_room_count(text, url)
@@ -717,7 +835,7 @@ async def scrape_all_sources():
                                 current["image"] = candidate["image"]
                             continue
 
-                        location = extract_location(text)
+                        location = extract_location(text, source)
                         image_url = candidate.get("image", "")
 
                         if current and not image_url:
@@ -970,8 +1088,14 @@ def format_listing(item: dict[str, Any]) -> str:
     if address and address.casefold() != item["location"].casefold():
         address_line = f"📌 <b>Адрес:</b> {safe_address}\n"
 
+    title = (
+        "🔎 <b>РЕЗУЛЬТАТ ПОИСКА</b>"
+        if item.get("manual_search")
+        else "🏠 <b>НОВОЕ ОБЪЯВЛЕНИЕ</b>"
+    )
+
     return (
-        "🏠 <b>НОВОЕ ОБЪЯВЛЕНИЕ</b>\n\n"
+        f"{title}\n\n"
         f"🌐 <b>Сайт:</b> "
         f"{html.escape(item['site'])}\n"
         "🔑 <b>Тип:</b> Аренда\n"
@@ -988,6 +1112,108 @@ def format_listing(item: dict[str, Any]) -> str:
     )
 
 
+def select_manual_listings(
+    listings: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    by_source: dict[str, list[dict[str, Any]]] = {}
+
+    for item in listings:
+        by_source.setdefault(
+            str(item["source_key"]),
+            [],
+        ).append(item)
+
+    for items in by_source.values():
+        items.sort(
+            key=lambda item: int(item["listing_id"]),
+            reverse=True,
+        )
+
+    selected: list[dict[str, Any]] = []
+    source_keys = list(by_source)
+    rank = 0
+
+    while len(selected) < limit:
+        added = False
+
+        for key in source_keys:
+            items = by_source[key]
+
+            if rank < len(items):
+                selected.append(items[rank])
+                added = True
+
+                if len(selected) >= limit:
+                    break
+
+        if not added:
+            break
+
+        rank += 1
+
+    return selected
+
+
+async def run_manual_search() -> int:
+    if MANUAL_DISTRICT not in DISTRICTS:
+        print(
+            f"Unknown MANUAL_DISTRICT: {MANUAL_DISTRICT}",
+            file=sys.stderr,
+        )
+        return 2
+
+    config = DISTRICTS[MANUAL_DISTRICT]
+    district_label = str(config["label_ru"])
+
+    send_telegram(
+        f"🔎 Ищу актуальные объявления: <b>{html.escape(district_label)}</b>..."
+    )
+
+    listings, errors = await scrape_all_sources(
+        manual_sources_for_district(MANUAL_DISTRICT)
+    )
+
+    if errors:
+        print("Manual search errors:")
+
+        for error in errors:
+            print(f"- {error}")
+
+    selected = select_manual_listings(
+        listings,
+        MANUAL_LIMIT,
+    )
+
+    if not selected:
+        send_telegram(
+            "ℹ️ По выбранному району подходящих объявлений "
+            "сейчас не найдено."
+        )
+        return 1 if errors else 0
+
+    for item in selected:
+        item["manual_search"] = True
+
+    await enrich_new_listings(selected)
+
+    for item in selected:
+        send_listing(item)
+
+    send_telegram(
+        f"✅ Поиск завершён: <b>{html.escape(district_label)}</b>. "
+        f"Отправлено объявлений: <b>{len(selected)}</b>."
+    )
+
+    print(
+        f"Manual search {MANUAL_DISTRICT}: "
+        f"found {len(listings)} listings; "
+        f"sent {len(selected)} results"
+    )
+
+    return 0
+
+
 async def main() -> int:
     if not TOKEN or not CHAT_ID:
         print(
@@ -996,6 +1222,9 @@ async def main() -> int:
             file=sys.stderr,
         )
         return 2
+
+    if MANUAL_DISTRICT:
+        return await run_manual_search()
 
     state = load_state()
     listings, errors = await scrape_all_sources()
