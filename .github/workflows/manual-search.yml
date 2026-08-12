@@ -38,5 +38,5 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MANUAL_DISTRICT: ${{ inputs.district }}
-          MANUAL_LIMIT: "10"
+          MANUAL_LIMIT: "30"
         run: python check_once.py
