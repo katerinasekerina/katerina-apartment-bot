@@ -6,6 +6,7 @@ import re
 import sys
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,7 @@ SOURCES = [
         "site": "MyHome.ge",
         "deal": "rent",
         "rooms": {1, 2},
-        "pages": 5,
+        "pages": 10,
         "url": (
             "https://www.myhome.ge/en/real-estate/rent/apartment/tbilisi/vake/1-room/"
             "?deal_types=2&real_estate_types=1&cities=1&urbans=38,47&districts=4"
@@ -151,6 +152,50 @@ def extract_location(text: str) -> str:
     return " / ".join(locations) if locations else "Ваке / Сабуртало"
 
 
+def extract_address(text: str, location: str) -> str:
+    patterns = (
+        r"([A-Za-zА-Яа-яЁёႠ-ჿ0-9 .()'’/-]{2,80}"
+        r"(?:st\.?|street|ave\.?|avenue|road|rd\.?|highway))",
+        r"([A-Za-zА-Яа-яЁёႠ-ჿ0-9 .()'’/-]{2,80}"
+        r"(?:ქუჩა|გამზირი|ჩიხი|გზატკეცილი))",
+        r"((?:ул\.?|улица|проспект)\s*"
+        r"[A-Za-zА-Яа-яЁёႠ-ჿ0-9 .()'’/-]{2,80})",
+    )
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+
+        if match:
+            address = normalize_text(match.group(1))
+            tail = text[match.end():]
+            number_match = re.match(
+                r"\s*(?:№|No\.?)?\s*([0-9][A-Za-z0-9/-]*)",
+                tail,
+                re.IGNORECASE,
+            )
+
+            if number_match:
+                after_number = tail[number_match.end():]
+
+                if not re.match(r"\s*m[²2]", after_number, re.IGNORECASE):
+                    address = f"{address} {number_match.group(1)}"
+
+            address = re.sub(
+                r"^.*(?:Vake|Saburtalo|Ваке|Сабуртало|ვაკე|საბურთალო)\s+",
+                "",
+                address,
+                flags=re.IGNORECASE,
+            )
+            address = re.sub(
+                r"^\d[\d ,.]*\s*(?:₾|\$|€)\s*",
+                "",
+                address,
+            )
+            return address[:100]
+
+    return location
+
+
 def listing_id_from_url(site: str, url: str) -> str | None:
     if site == "MyHome.ge":
         match = re.search(r"/real-estate/(\d+)(?:/|$)", url)
@@ -206,6 +251,7 @@ async def collect_page_links(page: Any) -> list[dict[str, str]]:
             );
 
             let node = anchor;
+            let card = anchor;
 
             for (
               let i = 0;
@@ -224,17 +270,284 @@ async def collect_page_links(page: Any) -> list[dict[str, str]]:
                 candidate.length <= 1200
               ) {
                 text = candidate;
+                card = node;
                 break;
               }
             }
 
-            results.push({href, text});
+            const imageNode =
+              card.querySelector('img') ||
+              anchor.querySelector('img');
+
+            let image = '';
+
+            if (imageNode) {
+              image = [
+                imageNode.currentSrc ||
+                '',
+                imageNode.src ||
+                '',
+                imageNode.getAttribute('data-src') ||
+                '',
+                imageNode.getAttribute('data-lazy-src') ||
+                '',
+                imageNode.getAttribute('data-original') ||
+                ''
+              ].find((value) => /^https?:\/\//i.test(value)) || '';
+            }
+
+            if (!image) {
+              const backgroundNode = Array.from(
+                card.querySelectorAll('*')
+              ).find((element) => {
+                const value = getComputedStyle(element).backgroundImage;
+                return value && value !== 'none' && /url\(/i.test(value);
+              });
+
+              if (backgroundNode) {
+                const value = getComputedStyle(
+                  backgroundNode
+                ).backgroundImage;
+                const match = value.match(/url\(["']?(.*?)["']?\)/i);
+                image = match ? match[1] : '';
+              }
+            }
+
+            if (!/^https?:\/\//i.test(image)) {
+              image = '';
+            }
+
+            results.push({href, text, image});
           }
 
           return results;
         }
         """
     )
+
+
+async def capture_listing_photo(page: Any) -> bytes:
+    image_data = await page.evaluate(
+        r"""
+        () => {
+          const absoluteUrl = (value) => {
+            if (!value) return '';
+
+            try {
+              return new URL(value, document.baseURI).href;
+            } catch (_) {
+              return '';
+            }
+          };
+
+          const blocked = /logo|icon|avatar|user|profile|flag|badge/i;
+          let best = null;
+
+          Array.from(document.images).forEach((image, index) => {
+            const source =
+              image.currentSrc ||
+              image.src ||
+              image.getAttribute('data-src') ||
+              image.getAttribute('data-lazy-src') ||
+              image.getAttribute('data-original') ||
+              '';
+
+            const width = Math.max(
+              image.naturalWidth || 0,
+              image.getBoundingClientRect().width || 0
+            );
+            const height = Math.max(
+              image.naturalHeight || 0,
+              image.getBoundingClientRect().height || 0
+            );
+
+            if (
+              width < 280 ||
+              height < 160 ||
+              blocked.test(`${source} ${image.alt || ''}`)
+            ) {
+              return;
+            }
+
+            const score = width * height;
+
+            if (!best || score > best.score) {
+              best = {
+                index,
+                source: absoluteUrl(source),
+                score
+              };
+            }
+          });
+
+          const metaSource = absoluteUrl(
+            document.querySelector(
+              'meta[property="og:image"], meta[name="twitter:image"]'
+            )?.content || ''
+          );
+
+          if (best) {
+            return {
+              index: best.index,
+              source: best.source || metaSource
+            };
+          }
+
+          let background = '';
+          let backgroundScore = 0;
+
+          for (const element of document.querySelectorAll('main *, article *')) {
+            const rect = element.getBoundingClientRect();
+
+            if (rect.width < 280 || rect.height < 160) {
+              continue;
+            }
+
+            const value = getComputedStyle(element).backgroundImage;
+            const match = value && value.match(/url\(["']?(.*?)["']?\)/i);
+
+            if (!match || blocked.test(match[1])) {
+              continue;
+            }
+
+            const score = rect.width * rect.height;
+
+            if (score > backgroundScore) {
+              background = absoluteUrl(match[1]);
+              backgroundScore = score;
+            }
+          }
+
+          return {
+            index: null,
+            source: background || metaSource
+          };
+        }
+        """
+    )
+
+    image_index = image_data.get("index")
+
+    if image_index is not None:
+        try:
+            image = page.locator("img").nth(int(image_index))
+            await image.scroll_into_view_if_needed(timeout=10_000)
+            photo = await image.screenshot(
+                type="jpeg",
+                quality=84,
+                animations="disabled",
+                timeout=20_000,
+            )
+
+            if len(photo) >= 2_000:
+                return photo
+        except Exception:
+            pass
+
+    image_url = str(image_data.get("source") or "").strip()
+
+    if image_url.startswith(("http://", "https://")):
+        image_page = await page.context.new_page()
+
+        try:
+            await image_page.goto(
+                image_url,
+                wait_until="load",
+                timeout=45_000,
+            )
+            image = image_page.locator("img").first
+            await image.wait_for(state="visible", timeout=15_000)
+            photo = await image.screenshot(
+                type="jpeg",
+                quality=84,
+                animations="disabled",
+                timeout=20_000,
+            )
+
+            if len(photo) >= 2_000:
+                return photo
+        except Exception:
+            pass
+        finally:
+            await image_page.close()
+
+    # Last-resort preview: the notification still has an image even when
+    # the source listing has no accessible photograph.
+    return await page.screenshot(
+        type="jpeg",
+        quality=78,
+        full_page=False,
+    )
+
+
+async def enrich_new_listings(items: list[dict[str, Any]]) -> None:
+    if not items:
+        return
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        context = await browser.new_context(
+            locale="en-US",
+            viewport={"width": 1440, "height": 1200},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/151.0.0.0 Safari/537.36"
+            ),
+        )
+
+        await context.add_init_script(
+            "Object.defineProperty("
+            "navigator, 'webdriver', "
+            "{get: () => undefined})"
+        )
+
+        for item in items:
+            page = await context.new_page()
+
+            try:
+                await page.goto(
+                    item["url"],
+                    wait_until="domcontentloaded",
+                    timeout=75_000,
+                )
+                await page.wait_for_timeout(3_000)
+
+                try:
+                    detail_text = normalize_text(
+                        await page.locator("body").inner_text(
+                            timeout=15_000
+                        )
+                    )
+                    detail_address = extract_address(
+                        detail_text,
+                        item["location"],
+                    )
+
+                    if detail_address != item["location"]:
+                        item["address"] = detail_address
+                except Exception:
+                    pass
+
+                item["photo_bytes"] = await capture_listing_photo(page)
+
+            except Exception as exc:
+                print(
+                    f"Detail page failed for {item['listing_id']}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            finally:
+                await page.close()
+
+        await context.close()
+        await browser.close()
 
 
 async def scrape_all_sources():
@@ -336,7 +649,18 @@ async def scrape_all_sources():
                             current
                             and len(current["summary"]) >= len(text)
                         ):
+                            if (
+                                not current.get("image")
+                                and candidate.get("image")
+                            ):
+                                current["image"] = candidate["image"]
                             continue
+
+                        location = extract_location(text)
+                        image_url = candidate.get("image", "")
+
+                        if current and not image_url:
+                            image_url = current.get("image", "")
 
                         found[key] = {
                             "source_key": source["key"],
@@ -347,7 +671,9 @@ async def scrape_all_sources():
                             "rooms": rooms,
                             "price": extract_price(text, usd_rate),
                             "area": extract_area(text),
-                            "location": extract_location(text),
+                            "location": location,
+                            "address": extract_address(text, location),
+                            "image": image_url,
                             "summary": text[:700],
                         }
 
@@ -454,12 +780,130 @@ def send_telegram(text: str) -> None:
             )
 
 
+def multipart_body(
+    fields: dict[str, str],
+    file_field: str,
+    file_name: str,
+    file_bytes: bytes,
+) -> tuple[bytes, str]:
+    boundary = f"----ApartmentBot{uuid.uuid4().hex}"
+    chunks: list[bytes] = []
+
+    for name, value in fields.items():
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("ascii"),
+                (
+                    f'Content-Disposition: form-data; name="{name}"'
+                    "\r\n\r\n"
+                ).encode("utf-8"),
+                str(value).encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+
+    chunks.extend(
+        [
+            f"--{boundary}\r\n".encode("ascii"),
+            (
+                "Content-Disposition: form-data; "
+                f'name="{file_field}"; filename="{file_name}"\r\n'
+                "Content-Type: image/jpeg\r\n\r\n"
+            ).encode("utf-8"),
+            file_bytes,
+            b"\r\n",
+            f"--{boundary}--\r\n".encode("ascii"),
+        ]
+    )
+
+    return b"".join(chunks), boundary
+
+
+def send_listing(item: dict[str, Any]) -> None:
+    caption = format_listing(item)
+    photo_bytes = item.get("photo_bytes")
+    image_url = str(item.get("image") or "").strip()
+
+    if (
+        isinstance(photo_bytes, bytes)
+        and 2_000 <= len(photo_bytes) <= 9_500_000
+    ):
+        try:
+            data, boundary = multipart_body(
+                {
+                    "chat_id": CHAT_ID,
+                    "caption": caption,
+                    "parse_mode": "HTML",
+                },
+                "photo",
+                f"listing-{item['listing_id']}.jpg",
+                photo_bytes,
+            )
+            request = urllib.request.Request(
+                f"https://api.telegram.org/bot{TOKEN}/sendPhoto",
+                data=data,
+                headers={
+                    "Content-Type": (
+                        f"multipart/form-data; boundary={boundary}"
+                    )
+                },
+                method="POST",
+            )
+
+            with urllib.request.urlopen(request, timeout=60) as response:
+                if response.status != 200:
+                    raise RuntimeError(
+                        f"Telegram returned HTTP {response.status}"
+                    )
+            return
+        except Exception as exc:
+            print(
+                f"Uploaded photo failed for {item['listing_id']}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    if not image_url:
+        send_telegram(caption)
+        return
+
+    data = urllib.parse.urlencode(
+        {
+            "chat_id": CHAT_ID,
+            "photo": image_url,
+            "caption": caption,
+            "parse_mode": "HTML",
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{TOKEN}/sendPhoto",
+        data=data,
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            if response.status != 200:
+                raise RuntimeError(
+                    f"Telegram returned HTTP {response.status}"
+                )
+    except Exception as exc:
+        print(
+            f"Photo delivery failed for {item['listing_id']}: "
+            f"{type(exc).__name__}: {exc}; sending text instead"
+        )
+        send_telegram(caption)
+
+
 def format_listing(item: dict[str, Any]) -> str:
     safe_url = html.escape(
         item["url"],
         quote=True,
     )
     safe_location = html.escape(item["location"])
+    safe_address = html.escape(
+        item.get("address") or item["location"]
+    )
     safe_price = html.escape(item["price"])
 
     return (
@@ -469,13 +913,12 @@ def format_listing(item: dict[str, Any]) -> str:
         "🔑 <b>Тип:</b> Аренда\n"
         f"📍 <b>Район:</b> "
         f"{safe_location}\n"
+        f"📌 <b>Адрес и цена:</b> "
+        f"{safe_address} — {safe_price}\n"
         f"🚪 <b>Комнат:</b> {item['rooms']}\n"
         f"📐 <b>Площадь:</b> "
         f"{html.escape(item['area'])}\n"
-        f"💰 <b>Цена:</b> "
-        f"{safe_price}\n"
-        f"🔎 <b>Поиск:</b> {safe_location} {safe_price} | "
-        f"{safe_price} {safe_location}\n\n"
+        "\n"
         f"🔗 <a href=\"{safe_url}\">"
         f"Открыть объявление</a>"
     )
@@ -540,9 +983,10 @@ async def main() -> int:
         new_items.sort(
             key=lambda item: int(item["listing_id"])
         )
+        await enrich_new_listings(new_items)
 
         for item in new_items:
-            send_telegram(format_listing(item))
+            send_listing(item)
 
     state["heartbeat_week"] = datetime.now(
         timezone.utc
