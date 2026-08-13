@@ -4,6 +4,8 @@ import json
 import os
 import re
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -129,6 +131,7 @@ def extract_price(text: str, usd_rate: float) -> str:
 
 
 def get_usd_rate() -> float:
+    """Get USD/GEL rate without letting a temporary NBG/DNS outage stop the run."""
     url = (
         "https://nbg.gov.ge/gw/api/ct/monetarypolicy/"
         "currencies/en/json/?currencies=USD"
@@ -138,18 +141,47 @@ def get_usd_rate() -> float:
         headers={"User-Agent": "Mozilla/5.0"},
     )
 
-    with urllib.request.urlopen(request, timeout=30) as response:
-        payload = json.load(response)
+    last_error: Exception | None = None
 
-    for day in payload:
-        for currency in day.get("currencies", []):
-            if currency.get("code") == "USD":
-                rate = float(currency["rate"])
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                payload = json.load(response)
 
-                if rate > 0:
-                    return rate
+            for day in payload:
+                for currency in day.get("currencies", []):
+                    if currency.get("code") == "USD":
+                        rate = float(currency["rate"])
+                        if rate > 0:
+                            return rate
 
-    raise RuntimeError("USD rate was not returned by NBG")
+            raise RuntimeError("USD rate was not returned by NBG")
+
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            json.JSONDecodeError,
+        ) as error:
+            last_error = error
+            print(
+                f"NBG USD rate attempt {attempt}/3 failed: {error}",
+                file=sys.stderr,
+            )
+            if attempt < 3:
+                time.sleep(2 * attempt)
+
+    fallback_rate = 2.70
+    print(
+        "WARNING: NBG USD rate unavailable after 3 attempts; "
+        f"using temporary fallback {fallback_rate:.2f} GEL/USD. "
+        f"Last error: {last_error}",
+        file=sys.stderr,
+    )
+    return fallback_rate
 
 
 def extract_area(text: str) -> str:
@@ -327,16 +359,49 @@ def extract_address(text: str, location: str) -> str:
 
 
 def listing_id_from_url(site: str, url: str) -> str | None:
-    if site == "MyHome.ge":
-        match = re.search(r"/real-estate/(\d+)(?:/|$)", url)
-    else:
+    """Extract a listing ID from both legacy and current MyHome URL formats."""
+    if site != "MyHome.ge":
         match = re.search(
             r"/real-estate/(?!l/)[^?#]*-(\d+)(?:[/?#]|$)",
             url,
+            re.IGNORECASE,
         )
+        return match.group(1) if match else None
 
-    return match.group(1) if match else None
+    try:
+        parts = urllib.parse.urlsplit(url)
+        path = urllib.parse.unquote(parts.path)
+    except Exception:
+        path = urllib.parse.unquote(url)
 
+    # Only treat URLs under known MyHome listing roots as listing candidates.
+    if not re.search(r"/(?:udzravi-qoneba|real-estate)(?:/|$)", path, re.IGNORECASE):
+        return None
+
+    patterns = (
+        r"/(?:udzravi-qoneba|real-estate)/(\d{6,10})(?:/|$)",
+        r"/(?:udzravi-qoneba|real-estate)/[^/?#]*-(\d{6,10})(?:/|$)",
+        r"-(\d{6,10})(?:/)?$",
+        r"/(\d{6,10})(?:/)?$",
+    )
+
+    for regex in patterns:
+        match = re.search(regex, path, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    try:
+        query = urllib.parse.parse_qs(parts.query)
+    except Exception:
+        query = {}
+
+    for key in ("id", "listing_id", "statement_id", "pr_id"):
+        values = query.get(key, [])
+        for value in values:
+            if re.fullmatch(r"\d{6,10}", value or ""):
+                return value
+
+    return None
 
 def page_url(url: str, page_number: int) -> str:
     parts = urllib.parse.urlsplit(url)
