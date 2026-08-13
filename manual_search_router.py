@@ -226,7 +226,7 @@ def manual_sources_for_district(district_key: str):
             "currency_id": "1",
             "CardView": "1",
             "owner_type": "physical",
-            "room_types": "1,2",
+            "room_types": "1,2,3",
             "page": "1",
         }
     )
@@ -245,7 +245,7 @@ def manual_sources_for_district(district_key: str):
 
     shared = {
         "deal": "rent",
-        "rooms": {1, 2},
+        "rooms": {1, 2, 3},
         "pages": int(config.get("pages", 5)),
         "district_aliases": config["aliases"],
         "district_label": config["label_ru"],
