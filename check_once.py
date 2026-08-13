@@ -67,19 +67,19 @@ SOURCES = [
         "key": "myhome_rent",
         "site": "MyHome.ge",
         "deal": "rent",
-        "rooms": {1, 2},
+        "rooms": {1, 2, 3},
         "pages": 10,
         "url": (
             "https://www.myhome.ge/en/real-estate/rent/apartment/tbilisi/vake/1-room/"
             "?deal_types=2&real_estate_types=1&cities=1&urbans=38,47&districts=4"
-            "&currency_id=1&CardView=1&owner_type=physical&room_types=1,2&page=1"
+            "&currency_id=1&CardView=1&owner_type=physical&room_types=1,2,3&page=1"
         ),
     },
     {
         "key": "ss_rent",
         "site": "SS.ge",
         "deal": "rent",
-        "rooms": {1, 2},
+        "rooms": {1, 2, 3},
         "pages": 10,
         "url": (
             "https://home.ss.ge/en/real-estate/l/Flat/For-Rent?cityIdList=95"
@@ -254,7 +254,7 @@ def manual_sources_for_district(
             "currency_id": "1",
             "CardView": "1",
             "owner_type": "physical",
-            "room_types": "1,2",
+            "room_types": "1,2,3",
             "page": "1",
         }
     )
@@ -271,7 +271,7 @@ def manual_sources_for_district(
     )
     shared = {
         "deal": "rent",
-        "rooms": {1, 2},
+        "rooms": {1, 2, 3},
         "pages": 3,
         "district_aliases": config["aliases"],
         "district_label": config["label_ru"],
