@@ -1,4 +1,4 @@
-"""Katerina Apartment Bot — manual_search_router FINAL_REBUILD_V2_VERIFIED
+"""Katerina Apartment Bot — manual_search_router FINAL_REBUILD_V3_MYHOME_PHOTO
 
 Rules:
 - MyHome.ge + SS.ge
@@ -189,6 +189,153 @@ def ss_clear_agency(raw: str) -> bool:
     return any(re.search(pat, s, re.I) for pat in strong)
 
 
+async def capture_myhome_photo(page: Any, preferred_url: str = "") -> bytes | None:
+    """
+    MyHome-specific photo capture.
+
+    MyHome can serve listing photos from CDN hosts that check_once.py does not
+    whitelist. We therefore collect the real image URLs from the detail page
+    and fetch them through Playwright using the same browser session/referrer.
+    If direct fetching is unavailable, we screenshot the largest visible
+    property image element. Logos/avatars/icons are excluded.
+    """
+    candidates = await page.evaluate(
+        r"""
+        () => {
+          const abs = (value) => {
+            if (!value) return '';
+            try { return new URL(value, document.baseURI).href; }
+            catch (_) { return ''; }
+          };
+
+          const blocked =
+            /logo|icon|avatar|profile|owner|badge|banner|advert|promo|favicon|sprite|flag|googleplay|appstore|qr/i;
+
+          const out = [];
+          const seen = new Set();
+
+          const add = (value, score, index = null, hint = '') => {
+            const url = abs(value);
+            if (!url || seen.has(url) || blocked.test(`${url} ${hint || ''}`)) return;
+            if (!/^https?:\/\//i.test(url)) return;
+            seen.add(url);
+            out.push({url, score, index});
+          };
+
+          for (const selector of [
+            'meta[property="og:image"]',
+            'meta[name="twitter:image"]',
+            'meta[property="twitter:image"]'
+          ]) {
+            const node = document.querySelector(selector);
+            if (node?.content) add(node.content, 5000000, null, selector);
+          }
+
+          Array.from(document.images).forEach((img, index) => {
+            const rect = img.getBoundingClientRect();
+            const w = Math.max(img.naturalWidth || 0, rect.width || 0);
+            const h = Math.max(img.naturalHeight || 0, rect.height || 0);
+            const hint = `${img.alt || ''} ${img.className || ''} ${img.id || ''}`;
+
+            if (w < 250 || h < 160) return;
+
+            const area = Math.min(w * h, 3000000);
+            let score = area;
+
+            if (/gallery|swiper|photo|image|slider|carousel/i.test(hint)) {
+              score += 1500000;
+            }
+
+            const urls = [
+              img.currentSrc,
+              img.src,
+              img.getAttribute('data-src'),
+              img.getAttribute('data-lazy-src'),
+              img.getAttribute('data-original')
+            ];
+
+            const srcset = img.getAttribute('srcset') || '';
+            for (const part of srcset.split(',')) {
+              urls.push((part.trim().split(/\s+/)[0] || ''));
+            }
+
+            for (const value of urls) {
+              add(value, score, index, hint);
+            }
+          });
+
+          out.sort((a, b) => b.score - a.score);
+          return out.slice(0, 20);
+        }
+        """
+    )
+
+    ordered_urls = []
+    if preferred_url:
+        ordered_urls.append(str(preferred_url).strip())
+    ordered_urls.extend(
+        str(item.get("url") or "").strip()
+        for item in candidates
+        if item.get("url")
+    )
+
+    seen_urls = set()
+    for image_url in ordered_urls:
+        if not image_url or image_url in seen_urls:
+            continue
+        seen_urls.add(image_url)
+
+        try:
+            response = await page.context.request.get(
+                image_url,
+                headers={
+                    "Referer": page.url,
+                    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                },
+                timeout=20_000,
+            )
+            if not response.ok:
+                continue
+
+            content_type = (response.headers.get("content-type") or "").lower()
+            if not content_type.startswith("image/"):
+                continue
+
+            photo = await response.body()
+            if 2_000 <= len(photo) <= 9_500_000:
+                print(f"MYHOME_PHOTO direct_ok bytes={len(photo)} url={image_url[:160]}")
+                return photo
+        except Exception as exc:
+            print(f"MYHOME_PHOTO direct_fail {type(exc).__name__}: {image_url[:160]}")
+
+    # Fallback: screenshot the largest visible image element itself.
+    for item in candidates:
+        index = item.get("index")
+        if index is None:
+            continue
+        try:
+            locator = page.locator("img").nth(int(index))
+            if not await locator.is_visible():
+                continue
+            box = await locator.bounding_box()
+            if not box or box["width"] < 250 or box["height"] < 160:
+                continue
+            photo = await locator.screenshot(
+                type="jpeg",
+                quality=88,
+                animations="disabled",
+                timeout=15_000,
+            )
+            if 2_000 <= len(photo) <= 9_500_000:
+                print(f"MYHOME_PHOTO element_ok bytes={len(photo)} index={index}")
+                return photo
+        except Exception:
+            continue
+
+    print("MYHOME_PHOTO no_real_photo_found")
+    return None
+
+
 async def verify(context: Any, c: dict[str,Any], label: str, aliases:set[str], rate:float) -> dict[str,Any] | None:
     site,url=c["site"],c["url"]
     if not exact_district(site,url,aliases) or room_from_url(site,url) not in {1,2,3}: return None
@@ -210,7 +357,11 @@ async def verify(context: Any, c: dict[str,Any], label: str, aliases:set[str], r
         if not lid:return None
         text=body if len(body)>len(c.get("text",'')) else c.get("text",'')
         item={"source_key":"manual_myhome" if site=="MyHome.ge" else "manual_ss","site":site,"deal":"rent","listing_id":lid,"url":url,"rooms":room_from_url(site,url),"price":check_once.extract_price(text,rate),"area":check_once.extract_area(text),"location":label,"address":check_once.extract_address(text,label),"image":c.get("image",''),"summary":c.get("text",'')[:700],"manual_search":True,"published_at":pub,"page_number":c["page"],"discovery_order":c["order"]}
-        item["photo_bytes"]=await check_once.capture_listing_photo(p,item["image"])
+        if site=="MyHome.ge":
+            myhome_photo=await capture_myhome_photo(p,item["image"])
+            item["photo_bytes"]=myhome_photo or await check_once.capture_listing_photo(p,item["image"])
+        else:
+            item["photo_bytes"]=await check_once.capture_listing_photo(p,item["image"])
         return item
     except Exception as e:
         print(f"VERIFY_FAIL {site} {url} {type(e).__name__}: {e}"); return None
