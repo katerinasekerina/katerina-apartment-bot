@@ -28,7 +28,7 @@ _ORIGINAL_SELECT_MANUAL_LISTINGS = check_once.select_manual_listings
 TBILISI_DISTRICTS = {
     "vake": {"label_ru": "Ваке", "myhome_slug": "vake", "ss_subdistrict_id": "47", "aliases": ("vake", "ვაკე", "ваке"), "url_aliases": ("vake",), "pages": 4},
     "saburtalo": {"label_ru": "Сабуртало", "myhome_slug": "saburtalo", "ss_subdistrict_id": "3", "aliases": ("saburtalo", "საბურთალო", "сабуртало"), "url_aliases": ("saburtalo",), "pages": 4},
-    "vashlijvari": {"label_ru": "Вашлиджвари", "myhome_slug": "vashlijvari", "ss_subdistrict_id": "48", "aliases": ("vashlijvari", "ვაშლიჯვარი", "вашлиджвари"), "url_aliases": ("vashlijvari",), "pages": 5},
+    "vashlijvari": {"label_ru": "Вашлиджвари", "myhome_slug": "vashlijvari", "ss_subdistrict_id": "48", "aliases": ("vashlijvari", "vaslidzvari", "ვაშლიჯვარი", "вашлиджвари"), "url_aliases": ("vashlijvari", "vaslidzvari"), "pages": 5},
     "lisi": {"label_ru": "Лиси", "myhome_slug": "lisi", "ss_subdistrict_id": "3", "aliases": ("lisi lake", "lisi", "ლისი", "ლისის ტბა", "лиси"), "url_aliases": ("lisi-lake", "lisi"), "pages": 5},
     "nutsubidze": {"label_ru": "Плато Нуцубидзе", "myhome_slug": "nucubidzis-perdobi", "ss_subdistrict_id": "3", "aliases": ("nutsubidze plateau", "nutsubidze", "nucubidze", "ნუცუბიძის პლ", "ნუცუბიძის ფერდობი", "нуцубидзе"), "url_aliases": ("nutsubidze-plateau", "nutsubidze", "nucubidze", "nucubidzis-perdobi"), "pages": 5},
     "vera": {"label_ru": "Вера", "myhome_slug": "vera", "ss_subdistrict_id": "20,21,22,23,51,52", "aliases": ("vera", "ვერა", "вера"), "url_aliases": ("vera",), "pages": 8},
@@ -70,6 +70,10 @@ def manual_listing_id_from_url(site: str, url: str):
             r"/(?:[a-z]{2}/)?pr/(\d{6,10})(?:/|$)",
             r"/real-estate/[^/?#]*-(\d{6,10})(?:/|$)",
             r"/udzravi-qoneba/[^/?#]*-(\d{6,10})(?:/|$)",
+            # Current localized MyHome URLs, e.g.
+            # /ru/nedvizhimost/sdaetsia-2-komnatnaia-kvartira-v-vaslidzvari-25771293/
+            # /en/real-estate/2-room-apartment-for-rent-in-vashlijvari-25771293/
+            r"/(?:[a-z]{2}/)?[^/?#]+/[^/?#]*-(\d{6,10})(?:/|$)",
         ):
             match = re.search(pattern, path, re.IGNORECASE)
             if match:
@@ -79,136 +83,168 @@ def manual_listing_id_from_url(site: str, url: str):
 
 
 async def manual_collect_page_links(page):
+    """
+    MYHOME DIAGNOSTIC/FIX STEP.
+
+    For MyHome only:
+    - collect every real listing-shaped anchor, including /en/pr/<ID>/...
+    - do NOT require a specific card DOM structure
+    - print diagnostics to GitHub Actions logs
+
+    SS.ge is deliberately left on the original production collector in this
+    step so we can isolate the MyHome problem first.
+    """
     current_url = str(page.url or "").lower()
 
-    if "myhome.ge" not in current_url and "home.ss.ge" not in current_url:
+    if "myhome.ge" not in current_url:
         return await _ORIGINAL_COLLECT_PAGE_LINKS(page)
 
-    return await page.evaluate(
+    payload = await page.evaluate(
         r"""
         () => {
           const clean = (value) =>
             (value || '').replace(/\s+/g, ' ').trim();
 
+          const allAnchors = Array.from(document.querySelectorAll('a[href]'));
           const results = [];
           const seen = new Set();
-          const isMyHome = /myhome\.ge/i.test(location.hostname);
-          const isSS = /home\.ss\.ge/i.test(location.hostname);
+          const numericSamples = [];
 
           const isListing = (href) => {
             if (!href) return false;
 
-            if (isMyHome) {
+            try {
+              const u = new URL(href, document.baseURI);
+              const path = decodeURIComponent(u.pathname || '');
+
               return (
-                /\/(?:[a-z]{2}\/)?pr\/\d{6,10}(?:\/|$)/i.test(href) ||
-                /\/real-estate\/[^?#]*-\d{6,10}(?:\/|$)/i.test(href) ||
-                /\/udzravi-qoneba\/[^?#]*-\d{6,10}(?:\/|$)/i.test(href)
+                /\/(?:[a-z]{2}\/)?pr\/\d{6,10}(?:\/|$)/i.test(path) ||
+                /\/real-estate\/[^?#]*-\d{6,10}(?:\/|$)/i.test(path) ||
+                /\/udzravi-qoneba\/[^?#]*-\d{6,10}(?:\/|$)/i.test(path) ||
+                /\/(?:[a-z]{2}\/)?[^/?#]+\/[^/?#]*-\d{6,10}(?:\/|$)/i.test(path)
               );
+            } catch (_) {
+              return false;
             }
-
-            if (isSS) {
-              return /\/real-estate\/(?!l\/)[^?#]*-\d{6,10}(?:[/?#]|$)/i.test(href);
-            }
-
-            return false;
           };
 
-          const usefulCard = (anchor) => {
+          const bestCardText = (anchor) => {
             let node = anchor;
-            let fallbackText = clean(
+            let best = clean(
               anchor.innerText ||
               anchor.getAttribute('aria-label') ||
               anchor.title ||
               ''
             );
-            let fallbackNode = anchor;
 
-            for (let depth = 0; depth < 7 && node; depth++) {
-              const text = clean(node.innerText || '');
+            for (let depth = 0; depth < 8 && node; depth++) {
+              const candidate = clean(node.innerText || '');
 
               if (
-                text.length >= 15 &&
-                text.length <= 1400 &&
-                /(?:m²|m2|room|ოთახ|комнат)/i.test(text)
+                candidate.length >= 10 &&
+                candidate.length <= 1600 &&
+                candidate.length > best.length
               ) {
-                return {node, text};
+                best = candidate;
               }
 
-              if (text.length >= fallbackText.length && text.length <= 1400) {
-                fallbackText = text;
-                fallbackNode = node;
+              if (
+                /(?:m²|m2|room|ოთახ|комнат)/i.test(candidate) &&
+                candidate.length >= 15 &&
+                candidate.length <= 1600
+              ) {
+                return candidate;
               }
 
               node = node.parentElement;
             }
 
-            return {node: fallbackNode, text: fallbackText};
+            return best;
           };
 
-          const getImage = (card, anchor) => {
-            const nodes = [
-              ...card.querySelectorAll('img'),
-              ...anchor.querySelectorAll('img')
-            ];
+          const imageFrom = (anchor) => {
+            let node = anchor;
 
-            for (const img of nodes) {
-              const candidates = [
-                img.currentSrc,
-                img.src,
-                img.getAttribute('data-src'),
-                img.getAttribute('data-lazy-src'),
-                img.getAttribute('data-original')
-              ];
+            for (let depth = 0; depth < 7 && node; depth++) {
+              for (const img of node.querySelectorAll('img')) {
+                const values = [
+                  img.currentSrc,
+                  img.src,
+                  img.getAttribute('data-src'),
+                  img.getAttribute('data-lazy-src'),
+                  img.getAttribute('data-original')
+                ];
 
-              const srcset =
-                img.getAttribute('srcset') ||
-                img.closest('picture')?.querySelector('source')?.srcset ||
-                '';
-
-              for (const part of srcset.split(',')) {
-                candidates.push(part.trim().split(/\s+/)[0] || '');
-              }
-
-              for (const value of candidates) {
-                if (
-                  value &&
-                  /^https?:\/\//i.test(value) &&
-                  !/logo|icon|avatar|profile|banner|advert|promo|favicon/i.test(value)
-                ) {
-                  return value;
+                for (const value of values) {
+                  if (
+                    value &&
+                    /^https?:\/\//i.test(value) &&
+                    !/logo|icon|avatar|banner|advert|promo|favicon/i.test(value)
+                  ) {
+                    return value;
+                  }
                 }
               }
+
+              node = node.parentElement;
             }
 
             return '';
           };
 
-          for (const anchor of document.querySelectorAll('a[href]')) {
-            const href = (anchor.href || '').split('#')[0];
+          for (const anchor of allAnchors) {
+            const href = anchor.href || '';
 
-            if (!isListing(href) || seen.has(href)) {
+            if (/\d{6,10}/.test(href) && numericSamples.length < 12) {
+              numericSamples.push(href);
+            }
+
+            if (!isListing(href)) {
               continue;
             }
 
-            const {node: card, text} = usefulCard(anchor);
+            const cleanHref = href.split('#')[0];
 
-            if (!text || text.length < 10) {
+            if (seen.has(cleanHref)) {
               continue;
             }
 
-            seen.add(href);
+            seen.add(cleanHref);
 
             results.push({
-              href,
-              text,
-              image: getImage(card, anchor)
+              href: cleanHref,
+              text: bestCardText(anchor),
+              image: imageFrom(anchor)
             });
           }
 
-          return results;
+          return {
+            totalAnchors: allAnchors.length,
+            listingCandidates: results.length,
+            numericSamples,
+            resultSamples: results.slice(0, 10).map(x => x.href),
+            results
+          };
         }
         """
     )
+
+    print(
+        "MYHOME_DIAG "
+        f"url={current_url} "
+        f"anchors={payload.get('totalAnchors', 0)} "
+        f"listing_candidates={payload.get('listingCandidates', 0)}"
+    )
+    print(
+        "MYHOME_DIAG numeric_samples="
+        + json.dumps(payload.get("numericSamples", []), ensure_ascii=False)
+    )
+    print(
+        "MYHOME_DIAG result_samples="
+        + json.dumps(payload.get("resultSamples", []), ensure_ascii=False)
+    )
+
+    return list(payload.get("results", []))
 
 
 def manual_is_target_location(text: str, url: str, source=None) -> bool:
@@ -339,7 +375,14 @@ def is_fresh_manual_listing(item: dict, hours: int = 24) -> bool:
 
 
 def manual_select_manual_listings(listings: list[dict], limit: int):
-    fresh = [item for item in listings if is_fresh_manual_listing(item, 24)]
+    # Diagnostic stage: MyHome is allowed through without freshness filtering
+    # so we can prove the collector works. SS.ge still uses the 24h rule.
+    fresh = [
+        item
+        for item in listings
+        if item.get("site") == "MyHome.ge"
+        or is_fresh_manual_listing(item, 24)
+    ]
 
     raw_by_site = {}
     fresh_by_site = {}
