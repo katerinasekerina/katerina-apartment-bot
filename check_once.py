@@ -736,6 +736,177 @@ async def capture_listing_photo(
     return await placeholder_photo(page.context)
 
 
+async def capture_myhome_photo(page: Any, preferred_url: str = "") -> bytes | None:
+    """
+    MyHome-specific photo capture for automatic monitoring.
+    Tries MyHome detail-page meta/gallery image URLs first, using the same
+    Playwright browser session and referrer. Falls back to screenshotting the
+    largest visible property image element.
+    """
+    candidates = await page.evaluate(
+        r"""
+        () => {
+          const absolute = (value) => {
+            if (!value) return '';
+            try { return new URL(value, document.baseURI).href; }
+            catch (_) { return ''; }
+          };
+
+          const blocked =
+            /logo|icon|avatar|profile|owner|flag|badge|banner|advert|promo|campaign|googleplay|appstore|qr|sprite|favicon/i;
+
+          const seen = new Set();
+          const out = [];
+
+          const add = (value, score, index = null, hint = '') => {
+            const url = absolute(value);
+            if (!url || seen.has(url)) return;
+            if (!/^https?:\/\//i.test(url)) return;
+            if (blocked.test(`${url} ${hint || ''}`)) return;
+            seen.add(url);
+            out.push({url, score, index});
+          };
+
+          for (const selector of [
+            'meta[property="og:image"]',
+            'meta[name="twitter:image"]',
+            'meta[property="twitter:image"]'
+          ]) {
+            const node = document.querySelector(selector);
+            if (node?.content) add(node.content, 6000000, null, selector);
+          }
+
+          Array.from(document.images).forEach((img, index) => {
+            const rect = img.getBoundingClientRect();
+            const width = Math.max(img.naturalWidth || 0, rect.width || 0);
+            const height = Math.max(img.naturalHeight || 0, rect.height || 0);
+            const hint = `${img.alt || ''} ${img.className || ''} ${img.id || ''}`;
+
+            if (width < 250 || height < 160) return;
+
+            let score = Math.min(width * height, 3000000);
+            if (/gallery|swiper|photo|image|slider|carousel/i.test(hint)) {
+              score += 1500000;
+            }
+
+            const urls = [
+              img.currentSrc,
+              img.src,
+              img.getAttribute('data-src'),
+              img.getAttribute('data-lazy-src'),
+              img.getAttribute('data-original')
+            ];
+
+            const srcset = img.getAttribute('srcset') || '';
+            for (const part of srcset.split(',')) {
+              urls.push((part.trim().split(/\s+/)[0] || ''));
+            }
+
+            for (const value of urls) {
+              add(value, score, index, hint);
+            }
+          });
+
+          out.sort((a, b) => b.score - a.score);
+          return out.slice(0, 20);
+        }
+        """
+    )
+
+    ordered_urls = []
+    if preferred_url:
+        ordered_urls.append(str(preferred_url).strip())
+
+    ordered_urls.extend(
+        str(item.get("url") or "").strip()
+        for item in candidates
+        if item.get("url")
+    )
+
+    seen_urls = set()
+
+    for image_url in ordered_urls:
+        if not image_url or image_url in seen_urls:
+            continue
+        seen_urls.add(image_url)
+
+        try:
+            response = await page.context.request.get(
+                image_url,
+                headers={
+                    "Referer": page.url,
+                    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                },
+                timeout=20_000,
+            )
+
+            if not response.ok:
+                continue
+
+            content_type = (
+                response.headers.get("content-type") or ""
+            ).lower()
+
+            if not content_type.startswith("image/"):
+                continue
+
+            photo = await response.body()
+
+            if 2_000 <= len(photo) <= 9_500_000:
+                print(
+                    f"MYHOME_AUTO_PHOTO direct_ok "
+                    f"bytes={len(photo)}"
+                )
+                return photo
+
+        except Exception as exc:
+            print(
+                f"MYHOME_AUTO_PHOTO direct_fail "
+                f"{type(exc).__name__}"
+            )
+
+    for item in candidates:
+        index = item.get("index")
+
+        if index is None:
+            continue
+
+        try:
+            locator = page.locator("img").nth(int(index))
+
+            if not await locator.is_visible():
+                continue
+
+            box = await locator.bounding_box()
+
+            if (
+                not box
+                or box["width"] < 250
+                or box["height"] < 160
+            ):
+                continue
+
+            photo = await locator.screenshot(
+                type="jpeg",
+                quality=88,
+                animations="disabled",
+                timeout=15_000,
+            )
+
+            if 2_000 <= len(photo) <= 9_500_000:
+                print(
+                    f"MYHOME_AUTO_PHOTO element_ok "
+                    f"bytes={len(photo)}"
+                )
+                return photo
+
+        except Exception:
+            continue
+
+    print("MYHOME_AUTO_PHOTO no_real_photo_found")
+    return None
+
+
 async def enrich_new_listings(items: list[dict[str, Any]]) -> None:
     if not items:
         return
@@ -775,10 +946,23 @@ async def enrich_new_listings(items: list[dict[str, Any]]) -> None:
                     timeout=75_000,
                 )
                 await page.wait_for_timeout(3_000)
-                item["photo_bytes"] = await capture_listing_photo(
-                    page,
-                    str(item.get("image") or ""),
-                )
+                if item.get("site") == "MyHome.ge":
+                    myhome_photo = await capture_myhome_photo(
+                        page,
+                        str(item.get("image") or ""),
+                    )
+                    item["photo_bytes"] = (
+                        myhome_photo
+                        or await capture_listing_photo(
+                            page,
+                            str(item.get("image") or ""),
+                        )
+                    )
+                else:
+                    item["photo_bytes"] = await capture_listing_photo(
+                        page,
+                        str(item.get("image") or ""),
+                    )
 
             except Exception as exc:
                 print(
