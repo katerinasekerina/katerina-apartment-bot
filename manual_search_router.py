@@ -54,7 +54,7 @@ DISTRICTS = {
 
 DISTRICT = os.getenv("MANUAL_DISTRICT", "").strip().lower()
 LIMIT = max(1, min(30, int(os.getenv("MANUAL_LIMIT", "30"))))
-FRESH_HOURS = max(24, min(168, int(os.getenv("MANUAL_FRESH_HOURS", "24"))))
+FRESH_HOURS = max(24, min(168, int(os.getenv("MANUAL_FRESH_HOURS", "72"))))
 TZ = ZoneInfo("Asia/Tbilisi")
 
 MONTHS = {
