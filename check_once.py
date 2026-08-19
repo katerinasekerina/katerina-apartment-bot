@@ -932,31 +932,107 @@ def whatsapp_link(phone: str) -> str:
     return f"https://wa.me/{digits}?text={text}"
 
 async def extract_listing_phone(page: Any) -> str | None:
+    """
+    Extract a Georgian mobile number from a listing detail page.
+
+    Strategy:
+    1) inspect visible DOM, tel:/WhatsApp links, page text and embedded scripts
+    2) click likely phone/contact reveal controls
+    3) inspect network responses triggered by reveal clicks
+    """
+
+    network_values: list[str] = []
+
+    def remember_network_response(response: Any) -> None:
+        async def collect() -> None:
+            try:
+                url = str(response.url or "")
+                if re.search(r"phone|contact|owner|seller|statement|listing|advert", url, re.I):
+                    network_values.append(url)
+
+                content_type = (response.headers.get("content-type") or "").lower()
+                if not any(token in content_type for token in ("json", "text", "javascript")):
+                    return
+
+                body = await response.text()
+                if body:
+                    network_values.append(body[:300_000])
+            except Exception:
+                return
+
+        try:
+            asyncio.create_task(collect())
+        except Exception:
+            pass
+
+    page.on("response", remember_network_response)
+
     async def collect_candidates() -> list[str]:
-        return await page.evaluate(
-            r"""
-            () => {
-              const values = [];
-              for (const a of document.querySelectorAll('a[href]')) {
-                const href = a.getAttribute('href') || '';
-                const text = (a.innerText || a.textContent || '').trim();
-                if (/^(tel:|https?:\/\/(?:api\.)?whatsapp\.com|https?:\/\/wa\.me)/i.test(href)) values.push(href);
-                if (/[+()\d][\d\s().-]{7,}/.test(text)) values.push(text);
-              }
-              const bodyText = document.body?.innerText || '';
-              values.push(...(bodyText.match(/(?:\+?995[\s().-]*)?5\d{2}(?:[\s().-]*\d){6}/g) || []));
-              return values.slice(0, 200);
-            }
-            """
-        )
+        values: list[str] = []
+        for frame in page.frames:
+            try:
+                frame_values = await frame.evaluate(
+                    r"""
+                    () => {
+                      const values = [];
+                      const add = (value) => {
+                        if (value === null || value === undefined) return;
+                        const text = String(value).trim();
+                        if (text) values.push(text);
+                      };
+
+                      for (const a of document.querySelectorAll('a[href]')) {
+                        add(a.getAttribute('href') || '');
+                        add(a.innerText || a.textContent || '');
+                      }
+
+                      for (const node of document.querySelectorAll(
+                        '[data-phone],[data-mobile],[data-tel],[data-contact],' +
+                        '[aria-label],[title],[value]'
+                      )) {
+                        add(node.getAttribute('data-phone'));
+                        add(node.getAttribute('data-mobile'));
+                        add(node.getAttribute('data-tel'));
+                        add(node.getAttribute('data-contact'));
+                        add(node.getAttribute('aria-label'));
+                        add(node.getAttribute('title'));
+                        add(node.getAttribute('value'));
+                      }
+
+                      add(document.body?.innerText || '');
+
+                      for (const script of document.querySelectorAll('script')) {
+                        const text = script.textContent || '';
+                        if (
+                          /phone|mobile|tel|contact|owner|seller|whatsapp/i.test(text) ||
+                          /(?:\+?995[\s().-]*)?5\d{2}(?:[\s().-]*\d){6}/.test(text)
+                        ) {
+                          add(text.slice(0, 500000));
+                        }
+                      }
+
+                      return values.slice(0, 700);
+                    }
+                    """
+                )
+                values.extend(frame_values)
+            except Exception:
+                continue
+        values.extend(network_values[-150:])
+        return values
 
     def normalize_candidates(values: list[str]) -> str | None:
+        patterns = (
+            r"(?:\+?995[\s().-]*)?5\d{2}(?:[\s().-]*\d){6}",
+            r"(?:00995[\s().-]*)5\d{2}(?:[\s().-]*\d){6}",
+        )
         for raw in values:
             decoded = urllib.parse.unquote(str(raw))
-            for fragment in re.findall(r"(?:\+?995[\s().-]*)?5\d{2}(?:[\s().-]*\d){6}", decoded):
-                phone = normalize_georgian_mobile(fragment)
-                if phone:
-                    return phone
+            for pattern in patterns:
+                for fragment in re.findall(pattern, decoded):
+                    phone = normalize_georgian_mobile(fragment)
+                    if phone:
+                        return phone
         return None
 
     phone = normalize_candidates(await collect_candidates())
@@ -967,30 +1043,93 @@ async def extract_listing_phone(page: Any) -> str | None:
         re.compile(r"show\s+(?:phone|number)", re.I),
         re.compile(r"phone\s*number", re.I),
         re.compile(r"contact\s+(?:owner|seller)", re.I),
+        re.compile(r"call\s+(?:owner|seller)", re.I),
         re.compile(r"ნომრ.*ჩვენებ", re.I),
         re.compile(r"ტელეფონ", re.I),
         re.compile(r"მობილურ", re.I),
+        re.compile(r"დაკავშირ", re.I),
+        re.compile(r"პატრონ", re.I),
         re.compile(r"показать\s+номер", re.I),
         re.compile(r"номер\s+телефона", re.I),
         re.compile(r"телефон", re.I),
+        re.compile(r"позвон", re.I),
+        re.compile(r"связат", re.I),
     )
-    for pattern in reveal_patterns:
+
+    for frame in page.frames:
+        for pattern in reveal_patterns:
+            try:
+                controls = frame.get_by_text(pattern)
+                for index in range(min(await controls.count(), 10)):
+                    control = controls.nth(index)
+                    if not await control.is_visible():
+                        continue
+                    try:
+                        await control.click(timeout=4_000)
+                        await page.wait_for_timeout(1_500)
+                    except Exception:
+                        continue
+                    phone = normalize_candidates(await collect_candidates())
+                    if phone:
+                        return phone
+            except Exception:
+                continue
+
+    for frame in page.frames:
         try:
-            controls = page.get_by_text(pattern)
-            for index in range(min(await controls.count(), 5)):
+            controls = frame.locator(
+                "button, [role='button'], a, [class*='phone'], [class*='mobile'], "
+                "[class*='contact'], [class*='call'], [class*='tel'], "
+                "[data-testid*='phone'], [data-testid*='contact']"
+            )
+            count = min(await controls.count(), 180)
+
+            for index in range(count):
                 control = controls.nth(index)
-                if not await control.is_visible():
-                    continue
                 try:
-                    await control.click(timeout=3_000)
-                    await page.wait_for_timeout(700)
+                    if not await control.is_visible():
+                        continue
+
+                    fingerprint = await control.evaluate(
+                        r"""
+                        (el) => [
+                          el.innerText || '',
+                          el.textContent || '',
+                          el.getAttribute('aria-label') || '',
+                          el.getAttribute('title') || '',
+                          el.getAttribute('class') || '',
+                          el.getAttribute('data-testid') || '',
+                          el.getAttribute('href') || '',
+                          el.innerHTML || ''
+                        ].join(' ').slice(0, 6000)
+                        """
+                    )
+
+                    if not re.search(
+                        r"phone|mobile|tel|contact|call|owner|seller|whatsapp|"
+                        r"ტელეფონ|მობილურ|ნომერ|დაკავშირ|დარეკ|მეპატრონ|პატრონ|"
+                        r"телефон|номер|позвон|связат",
+                        fingerprint,
+                        re.I,
+                    ):
+                        continue
+
+                    try:
+                        await control.click(timeout=3_000)
+                        await page.wait_for_timeout(1_500)
+                    except Exception:
+                        continue
+
+                    phone = normalize_candidates(await collect_candidates())
+                    if phone:
+                        return phone
+
                 except Exception:
                     continue
-                phone = normalize_candidates(await collect_candidates())
-                if phone:
-                    return phone
         except Exception:
             continue
+
+    await page.wait_for_timeout(1_000)
     return normalize_candidates(await collect_candidates())
 
 
