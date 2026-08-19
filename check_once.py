@@ -1330,7 +1330,7 @@ def listing_reply_markup(item: dict[str, Any]) -> str:
             "inline_keyboard": [
                 [
                     {
-                        "text": "💬  НАПИСАТЬ В WHATSAPP  💬",
+                        "text": "🟢 НАПИСАТЬ В WHATSAPP",
                         "url": url,
                     }
                 ]
