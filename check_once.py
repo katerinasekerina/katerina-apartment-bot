@@ -907,6 +907,93 @@ async def capture_myhome_photo(page: Any, preferred_url: str = "") -> bytes | No
     return None
 
 
+WHATSAPP_PREFILL_TEXT = (
+    "გამარჯობა. თქვენი ბინის განცხადებასთან დაკავშირებით გწერთ. "
+    "მყავს რამდენიმე კლიენტი, ვისთვისაც თქვენი ბინა შესაძლოა საინტერესო იყოს. "
+    "მაინტერესებს, თანამშრომლობთ თუ არა სააგენტოებთან და შესაძლებელია თუ არა "
+    "ბინის ჩვენება ჩემი კლიენტებისთვის?"
+)
+
+def normalize_georgian_mobile(value: str) -> str | None:
+    digits = re.sub(r"\D", "", value or "")
+    if digits.startswith("00995"):
+        digits = digits[2:]
+    local = digits[3:] if digits.startswith("995") else digits
+    if len(local) != 9 or not local.startswith("5"):
+        return None
+    return f"+995{local}"
+
+def whatsapp_link(phone: str) -> str:
+    normalized = normalize_georgian_mobile(phone)
+    if not normalized:
+        return ""
+    digits = normalized.lstrip("+")
+    text = urllib.parse.quote(WHATSAPP_PREFILL_TEXT, safe="")
+    return f"https://wa.me/{digits}?text={text}"
+
+async def extract_listing_phone(page: Any) -> str | None:
+    async def collect_candidates() -> list[str]:
+        return await page.evaluate(
+            r"""
+            () => {
+              const values = [];
+              for (const a of document.querySelectorAll('a[href]')) {
+                const href = a.getAttribute('href') || '';
+                const text = (a.innerText || a.textContent || '').trim();
+                if (/^(tel:|https?:\/\/(?:api\.)?whatsapp\.com|https?:\/\/wa\.me)/i.test(href)) values.push(href);
+                if (/[+()\d][\d\s().-]{7,}/.test(text)) values.push(text);
+              }
+              const bodyText = document.body?.innerText || '';
+              values.push(...(bodyText.match(/(?:\+?995[\s().-]*)?5\d{2}(?:[\s().-]*\d){6}/g) || []));
+              return values.slice(0, 200);
+            }
+            """
+        )
+
+    def normalize_candidates(values: list[str]) -> str | None:
+        for raw in values:
+            decoded = urllib.parse.unquote(str(raw))
+            for fragment in re.findall(r"(?:\+?995[\s().-]*)?5\d{2}(?:[\s().-]*\d){6}", decoded):
+                phone = normalize_georgian_mobile(fragment)
+                if phone:
+                    return phone
+        return None
+
+    phone = normalize_candidates(await collect_candidates())
+    if phone:
+        return phone
+
+    reveal_patterns = (
+        re.compile(r"show\s+(?:phone|number)", re.I),
+        re.compile(r"phone\s*number", re.I),
+        re.compile(r"contact\s+(?:owner|seller)", re.I),
+        re.compile(r"ნომრ.*ჩვენებ", re.I),
+        re.compile(r"ტელეფონ", re.I),
+        re.compile(r"მობილურ", re.I),
+        re.compile(r"показать\s+номер", re.I),
+        re.compile(r"номер\s+телефона", re.I),
+        re.compile(r"телефон", re.I),
+    )
+    for pattern in reveal_patterns:
+        try:
+            controls = page.get_by_text(pattern)
+            for index in range(min(await controls.count(), 5)):
+                control = controls.nth(index)
+                if not await control.is_visible():
+                    continue
+                try:
+                    await control.click(timeout=3_000)
+                    await page.wait_for_timeout(700)
+                except Exception:
+                    continue
+                phone = normalize_candidates(await collect_candidates())
+                if phone:
+                    return phone
+        except Exception:
+            continue
+    return normalize_candidates(await collect_candidates())
+
+
 async def enrich_new_listings(items: list[dict[str, Any]]) -> None:
     if not items:
         return
@@ -946,6 +1033,17 @@ async def enrich_new_listings(items: list[dict[str, Any]]) -> None:
                     timeout=75_000,
                 )
                 await page.wait_for_timeout(3_000)
+
+                if not item.get("manual_search"):
+                    try:
+                        item["phone"] = await extract_listing_phone(page)
+                        if item.get("phone"):
+                            print(f"OWNER_PHONE {item['site']} {item['listing_id']}: {item['phone']}")
+                        else:
+                            print(f"OWNER_PHONE not_found {item['site']} {item['listing_id']}")
+                    except Exception as exc:
+                        print(f"OWNER_PHONE failed {item['site']} {item['listing_id']}: {type(exc).__name__}: {exc}")
+
                 if item.get("site") == "MyHome.ge":
                     myhome_photo = await capture_myhome_photo(
                         page,
@@ -1182,15 +1280,21 @@ def save_state(state: dict[str, Any]) -> None:
     )
 
 
-def send_telegram(text: str) -> None:
-    data = urllib.parse.urlencode(
-        {
-            "chat_id": CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "true",
-        }
-    ).encode("utf-8")
+def send_telegram(
+    text: str,
+    reply_markup: str = "",
+) -> None:
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "true",
+    }
+
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
+    data = urllib.parse.urlencode(payload).encode("utf-8")
 
     request = urllib.request.Request(
         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
@@ -1206,6 +1310,35 @@ def send_telegram(text: str) -> None:
             raise RuntimeError(
                 f"Telegram returned HTTP {response.status}"
             )
+
+
+def listing_reply_markup(item: dict[str, Any]) -> str:
+    """Single full-row WhatsApp button for automatic listings only."""
+    if item.get("manual_search"):
+        return ""
+
+    phone = normalize_georgian_mobile(str(item.get("phone") or ""))
+    if not phone:
+        return ""
+
+    url = whatsapp_link(phone)
+    if not url:
+        return ""
+
+    return json.dumps(
+        {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "💬  НАПИСАТЬ В WHATSAPP  💬",
+                        "url": url,
+                    }
+                ]
+            ]
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def multipart_body(
@@ -1249,6 +1382,7 @@ def multipart_body(
 
 def send_listing(item: dict[str, Any]) -> None:
     caption = format_listing(item)
+    reply_markup = listing_reply_markup(item)
     photo_bytes = item.get("photo_bytes")
     image_url = str(item.get("image") or "").strip()
 
@@ -1257,12 +1391,16 @@ def send_listing(item: dict[str, Any]) -> None:
         and 2_000 <= len(photo_bytes) <= 9_500_000
     ):
         try:
+            fields = {
+                "chat_id": CHAT_ID,
+                "caption": caption,
+                "parse_mode": "HTML",
+            }
+            if reply_markup:
+                fields["reply_markup"] = reply_markup
+
             data, boundary = multipart_body(
-                {
-                    "chat_id": CHAT_ID,
-                    "caption": caption,
-                    "parse_mode": "HTML",
-                },
+                fields,
                 "photo",
                 f"listing-{item['listing_id']}.jpg",
                 photo_bytes,
@@ -1291,17 +1429,19 @@ def send_listing(item: dict[str, Any]) -> None:
             )
 
     if not image_url:
-        send_telegram(caption)
+        send_telegram(caption, reply_markup)
         return
 
-    data = urllib.parse.urlencode(
-        {
-            "chat_id": CHAT_ID,
-            "photo": image_url,
-            "caption": caption,
-            "parse_mode": "HTML",
-        }
-    ).encode("utf-8")
+    payload = {
+        "chat_id": CHAT_ID,
+        "photo": image_url,
+        "caption": caption,
+        "parse_mode": "HTML",
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
+    data = urllib.parse.urlencode(payload).encode("utf-8")
 
     request = urllib.request.Request(
         f"https://api.telegram.org/bot{TOKEN}/sendPhoto",
@@ -1320,7 +1460,7 @@ def send_listing(item: dict[str, Any]) -> None:
             f"Photo delivery failed for {item['listing_id']}: "
             f"{type(exc).__name__}: {exc}; sending text instead"
         )
-        send_telegram(caption)
+        send_telegram(caption, reply_markup)
 
 
 def format_listing(item: dict[str, Any]) -> str:
