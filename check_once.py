@@ -997,6 +997,12 @@ async def extract_listing_phone(page: Any, site: str) -> str | None:
                       const contactHintRe =
                         /phone|mobile|tel|contact|call|show.?number|whatsapp|ნომრ|ტელეფონ|მობილურ|დარეკ|დაკავშირ|номер|телефон|позвон|связат/i;
 
+                      // MyHome often renders the owner's mobile masked, e.g.
+                      // "593 124 ***". That is still a strong contact-card
+                      // signal even though it is not yet a complete phone.
+                      const maskedPhoneRe =
+                        /(?:\+?995[\s().-]*)?5\d{2}(?:[\s().-]*\d){3,5}[\s().-]*\*{2,}/;
+
                       const markers = Array.from(document.querySelectorAll('*'))
                         .filter((el) => {
                           const own = clean(el.textContent);
@@ -1034,10 +1040,12 @@ async def extract_listing_phone(page: Any, site: str) -> str | None:
                             ].join(' ')).join(' ')
                           );
 
-                          const hasPhone = phoneRe.test(`${text} ${fingerprint}`);
+                          const combined = `${text} ${fingerprint}`;
+                          const hasPhone = phoneRe.test(combined);
+                          const hasMaskedPhone = maskedPhoneRe.test(combined);
                           const hasContactControl = contactHintRe.test(fingerprint);
 
-                          if (!hasPhone && !hasContactControl) continue;
+                          if (!hasPhone && !hasMaskedPhone && !hasContactControl) continue;
 
                           // Prefer the smallest ancestor that contains the
                           // owner label plus a phone/contact control.
@@ -1045,6 +1053,7 @@ async def extract_listing_phone(page: Any, site: str) -> str | None:
                             text.length +
                             depth * 120 -
                             (hasPhone ? 800 : 0) -
+                            (hasMaskedPhone ? 600 : 0) -
                             (hasContactControl ? 300 : 0);
 
                           if (!best || score < best.score) {
