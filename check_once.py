@@ -941,35 +941,98 @@ async def extract_listing_phone(page: Any, site: str) -> str | None:
     """
     Extract the listing owner's/seller's Georgian mobile safely.
 
-    Strategy:
-    1) Prefer a site-specific owner/seller contact card.
-    2) If the phone is masked, reveal only phone-like controls.
-    3) Compare phone candidates before/after the reveal.
-       If exactly one NEW Georgian mobile appears, accept it.
-    4) Never fall back to "first mobile found on page".
+    Safety rules:
+    - Never choose the first phone found on the page.
+    - Prefer the owner/seller contact card.
+    - When a masked number is shown (for example 597 14 35 **),
+      match the visible digits against full Georgian mobile candidates.
+    - If more than one full number is revealed, accept only the one that
+      matches the masked owner-number prefix.
+    - If the result is still ambiguous, return None.
     """
 
     if site not in {"MyHome.ge", "SS.ge"}:
         return None
 
     mobile_pattern = r"(?:\+?995[\s().-]*)?5\d{2}(?:[\s().-]*\d){6}"
+    masked_pattern = (
+        r"(?:\+?995[\s().-]*)?"
+        r"(5\d{2}(?:[\s().-]*\d){2,5})"
+        r"[\s().-]*\*{2,}"
+    )
+
+    def decoded_text(value: str) -> str:
+        return (
+            urllib.parse.unquote(str(value or ""))
+            .replace("\\u002B", "+")
+            .replace("\\/", "/")
+            .replace("&nbsp;", " ")
+        )
 
     def phones_from_values(values: list[str]) -> list[str]:
         out: list[str] = []
         seen: set[str] = set()
         for raw in values:
-            decoded = urllib.parse.unquote(str(raw or ""))
-            decoded = (
-                decoded.replace("\\u002B", "+")
-                .replace("\\/", "/")
-                .replace("&nbsp;", " ")
-            )
+            decoded = decoded_text(raw)
             for fragment in re.findall(mobile_pattern, decoded):
                 phone = normalize_georgian_mobile(fragment)
                 if phone and phone not in seen:
                     seen.add(phone)
                     out.append(phone)
         return out
+
+    def masked_prefixes_from_values(values: list[str]) -> list[str]:
+        """
+        Turn masked owner numbers into local digit prefixes.
+
+        Examples:
+          597 14 35 ** -> 5971435
+          597 143 ***  -> 597143
+          +995 597 14 35 ** -> 5971435
+        """
+        prefixes: list[str] = []
+        seen: set[str] = set()
+
+        for raw in values:
+            decoded = decoded_text(raw)
+            for match in re.finditer(masked_pattern, decoded, re.I):
+                digits = re.sub(r"\D", "", match.group(1) or "")
+                if digits.startswith("995"):
+                    digits = digits[3:]
+                if (
+                    5 <= len(digits) <= 9
+                    and digits.startswith("5")
+                    and digits not in seen
+                ):
+                    seen.add(digits)
+                    prefixes.append(digits)
+
+        return prefixes
+
+    def match_masked_phone(
+        phones: list[str] | set[str],
+        prefixes: list[str] | set[str],
+    ) -> str | None:
+        """
+        Return a phone only when masked digits identify exactly one candidate.
+        """
+        phone_list = list(dict.fromkeys(str(p) for p in phones if p))
+        prefix_list = list(dict.fromkeys(str(p) for p in prefixes if p))
+
+        matches: list[str] = []
+        for phone in phone_list:
+            normalized = normalize_georgian_mobile(phone)
+            if not normalized:
+                continue
+            local = re.sub(r"\D", "", normalized)
+            if local.startswith("995"):
+                local = local[3:]
+
+            if any(local.startswith(prefix) for prefix in prefix_list):
+                if normalized not in matches:
+                    matches.append(normalized)
+
+        return matches[0] if len(matches) == 1 else None
 
     async def collect_frame_values(frame: Any) -> list[str]:
         try:
@@ -999,7 +1062,6 @@ async def extract_listing_phone(page: Any, site: str) -> str | None:
                     add(el.innerText || el.textContent || '');
                   }
 
-                  // Some sites keep the revealed number in page-state JSON.
                   for (const script of document.querySelectorAll(
                     'script[type="application/ld+json"],script[type="application/json"],' +
                     'script#__NEXT_DATA__,script#__NUXT_DATA__'
@@ -1007,18 +1069,21 @@ async def extract_listing_phone(page: Any, site: str) -> str | None:
                     add(script.textContent || '');
                   }
 
-                  return out.slice(0, 1200);
+                  return out.slice(0, 1400);
                 }
                 """
             )
         except Exception:
             return []
 
-    async def collect_all_phones() -> list[str]:
+    async def collect_all_values() -> list[str]:
         values: list[str] = []
         for frame in page.frames:
             values.extend(await collect_frame_values(frame))
-        return phones_from_values(values)
+        return values
+
+    async def collect_all_phones() -> list[str]:
+        return phones_from_values(await collect_all_values())
 
     if site == "MyHome.ge":
         marker_source = r"^(?:owner|მეპატრონე|владелец)$"
@@ -1052,9 +1117,7 @@ async def extract_listing_phone(page: Any, site: str) -> str | None:
                         /phone|mobile|tel|contact|call|show.?number|show.?phone|whatsapp|ნომრ|ტელეფონ|მობილურ|დარეკ|დაკავშირ|номер|телефон|позвон|связат/i;
 
                       const markers = Array.from(
-                        document.querySelectorAll(
-                          'body *'
-                        )
+                        document.querySelectorAll('body *')
                       ).filter((el) => {
                         const own = clean(el.textContent);
                         if (!own || own.length > 80) return false;
@@ -1174,29 +1237,49 @@ async def extract_listing_phone(page: Any, site: str) -> str | None:
                     add(el.innerText || el.textContent || '');
                   }
 
-                  return out.slice(0, 400);
+                  return out.slice(0, 500);
                 }
                 """
             )
         except Exception:
             return []
 
-    # 1) First try the isolated owner/seller card directly.
     marked_frames: list[Any] = []
+    owner_masked_prefixes: list[str] = []
+
+    # 1) Isolate the owner/seller card and remember its masked number.
     for frame in page.frames:
         if await mark_best_contact_card(frame):
             marked_frames.append(frame)
-            phones = phones_from_values(
-                await values_from_marked_card(frame)
-            )
-            if len(phones) == 1:
-                return phones[0]
+            card_values = await values_from_marked_card(frame)
+            card_phones = phones_from_values(card_values)
+            card_prefixes = masked_prefixes_from_values(card_values)
 
-    # Snapshot every phone already visible BEFORE revealing anything.
-    before = set(await collect_all_phones())
+            for prefix in card_prefixes:
+                if prefix not in owner_masked_prefixes:
+                    owner_masked_prefixes.append(prefix)
 
-    async def click_phone_controls_in_card(frame: Any) -> bool:
-        clicked = False
+            if len(card_phones) == 1:
+                return card_phones[0]
+
+            matched = match_masked_phone(card_phones, card_prefixes)
+            if matched:
+                return matched
+
+    # Some frameworks already store full numbers in page JSON before reveal.
+    # If the owner's masked prefix identifies exactly one of them, use it.
+    before_values = await collect_all_values()
+    before_phones_list = phones_from_values(before_values)
+    before = set(before_phones_list)
+
+    matched_before = match_masked_phone(
+        before_phones_list,
+        owner_masked_prefixes,
+    )
+    if matched_before:
+        return matched_before
+
+    async def click_phone_controls_in_card(frame: Any) -> tuple[bool, list[str]]:
         try:
             controls = frame.locator(
                 '[data-owner-contact-card="1"] a[href], '
@@ -1211,7 +1294,7 @@ async def extract_listing_phone(page: Any, site: str) -> str | None:
             )
             count = min(await controls.count(), 60)
         except Exception:
-            return False
+            return False, []
 
         for index in range(count):
             control = controls.nth(index)
@@ -1242,52 +1325,85 @@ async def extract_listing_phone(page: Any, site: str) -> str | None:
                 ):
                     continue
 
+                prefixes = masked_prefixes_from_values([fingerprint])
+                for prefix in prefixes:
+                    if prefix not in owner_masked_prefixes:
+                        owner_masked_prefixes.append(prefix)
+
                 href = ""
                 try:
                     href = await control.get_attribute("href") or ""
                 except Exception:
                     pass
 
-                # Do not navigate away to tel:/whatsapp links if number is
-                # already encoded in the href; just read it.
                 direct = phones_from_values([href, fingerprint])
-                if len(direct) == 1:
-                    return True
+                matched_direct = match_masked_phone(
+                    direct,
+                    owner_masked_prefixes,
+                )
+                if matched_direct:
+                    return True, owner_masked_prefixes
 
                 try:
                     await control.click(timeout=4_000)
                 except Exception:
                     continue
 
-                clicked = True
                 await page.wait_for_timeout(1_600)
-
-                # If the framework replaced the card, tag it again.
                 await mark_best_contact_card(frame)
-                break
+                return True, owner_masked_prefixes
             except Exception:
                 continue
 
-        return clicked
+        return False, owner_masked_prefixes
 
-    # 2) Preferred reveal: only inside the isolated contact card.
+    # 2) Reveal inside isolated owner/seller card.
     for frame in marked_frames:
         await click_phone_controls_in_card(frame)
 
-        phones = phones_from_values(
-            await values_from_marked_card(frame)
-        )
-        if len(phones) == 1:
-            return phones[0]
+        card_values = await values_from_marked_card(frame)
+        card_phones = phones_from_values(card_values)
+        card_prefixes = masked_prefixes_from_values(card_values)
 
-        after = set(await collect_all_phones())
+        for prefix in card_prefixes:
+            if prefix not in owner_masked_prefixes:
+                owner_masked_prefixes.append(prefix)
+
+        matched_card = match_masked_phone(
+            card_phones,
+            owner_masked_prefixes,
+        )
+        if matched_card:
+            return matched_card
+
+        if len(card_phones) == 1:
+            return card_phones[0]
+
+        after_list = await collect_all_phones()
+        after = set(after_list)
         newly_revealed = sorted(after - before)
+
+        # Key fix: multiple full numbers may appear after Show number.
+        # Use the masked owner-number prefix to identify the correct one.
+        matched_new = match_masked_phone(
+            newly_revealed,
+            owner_masked_prefixes,
+        )
+        if matched_new:
+            return matched_new
+
+        matched_after = match_masked_phone(
+            after_list,
+            owner_masked_prefixes,
+        )
+        if matched_after:
+            return matched_after
+
         if len(newly_revealed) == 1:
             return newly_revealed[0]
 
-    # 3) Site UIs sometimes have no literal Owner/Seller label.
-    #    In that case click only strongly phone-like visible controls,
-    #    then accept ONLY one newly revealed Georgian mobile number.
+    # 3) Some pages have no literal Owner/Seller label.
+    # Use only strongly phone-like visible controls.
     for frame in page.frames:
         try:
             controls = frame.locator(
@@ -1296,7 +1412,7 @@ async def extract_listing_phone(page: Any, site: str) -> str | None:
                 '[class*="contact" i], [class*="call" i], '
                 '[aria-label], [title]'
             )
-            count = min(await controls.count(), 140)
+            count = min(await controls.count(), 180)
         except Exception:
             continue
 
@@ -1315,12 +1431,10 @@ async def extract_listing_phone(page: Any, site: str) -> str | None:
                       el.getAttribute('aria-label') || '',
                       el.getAttribute('title') || '',
                       el.getAttribute('class') || ''
-                    ].join(' ').slice(0, 2500)
+                    ].join(' ').slice(0, 3000)
                     """
                 )
 
-                # Strong reveal signal only. This intentionally excludes
-                # generic navigation/contact elements.
                 if not re.search(
                     r"show.?number|show.?phone|phone.?number|"
                     r"ნომრის?\s*ნახვა|ნომრ|ტელეფონ|დარეკ|"
@@ -1331,6 +1445,24 @@ async def extract_listing_phone(page: Any, site: str) -> str | None:
                 ):
                     continue
 
+                control_prefixes = masked_prefixes_from_values(
+                    [fingerprint]
+                )
+                if not control_prefixes and not re.search(
+                    r"show.?number|show.?phone|"
+                    r"ნომრ|ტელეფონ|"
+                    r"показать.?номер|телефон",
+                    fingerprint,
+                    re.I,
+                ):
+                    continue
+
+                combined_prefixes = list(
+                    dict.fromkeys(
+                        owner_masked_prefixes + control_prefixes
+                    )
+                )
+
                 href = ""
                 try:
                     href = await control.get_attribute("href") or ""
@@ -1338,10 +1470,13 @@ async def extract_listing_phone(page: Any, site: str) -> str | None:
                     pass
 
                 direct = phones_from_values([href, fingerprint])
-                if len(direct) == 1 and direct[0] not in before:
-                    return direct[0]
+                matched_direct = match_masked_phone(
+                    direct,
+                    combined_prefixes,
+                )
+                if matched_direct:
+                    return matched_direct
 
-                # Avoid following external links.
                 if re.match(r"^\s*https?://", href, re.I):
                     continue
 
@@ -1352,30 +1487,51 @@ async def extract_listing_phone(page: Any, site: str) -> str | None:
 
                 await page.wait_for_timeout(1_700)
 
-                after = set(await collect_all_phones())
+                after_list = await collect_all_phones()
+                after = set(after_list)
                 newly_revealed = sorted(after - before)
+
+                matched_new = match_masked_phone(
+                    newly_revealed,
+                    combined_prefixes,
+                )
+                if matched_new:
+                    return matched_new
+
+                # Important for MyHome: full phones can already be present in
+                # page-state JSON, so nothing "new" may appear after click.
+                matched_after = match_masked_phone(
+                    after_list,
+                    combined_prefixes,
+                )
+                if matched_after:
+                    return matched_after
 
                 if len(newly_revealed) == 1:
                     return newly_revealed[0]
 
-                # If nothing new appeared but the entire page has exactly one
-                # Georgian mobile, that is still unambiguous.
                 if not newly_revealed and len(after) == 1:
                     return next(iter(after))
 
-                # Multiple candidates => fail closed; do not guess.
+                # Multiple candidates without a unique masked match: fail safe.
                 if len(newly_revealed) > 1:
-                    return None
+                    continue
             except Exception:
                 continue
 
-    # Final safe fallback: accept only an unambiguous single mobile on page.
     final_phones = await collect_all_phones()
+
+    matched_final = match_masked_phone(
+        final_phones,
+        owner_masked_prefixes,
+    )
+    if matched_final:
+        return matched_final
+
     if len(final_phones) == 1:
         return final_phones[0]
 
     return None
-
 
 async def enrich_new_listings(items: list[dict[str, Any]]) -> None:
     if not items:
