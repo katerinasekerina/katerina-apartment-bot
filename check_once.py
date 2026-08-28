@@ -60,6 +60,12 @@ DISTRICTS = {
         "ss_subdistrict_id": 10,
         "aliases": ("isani", "ისანი", "исани"),
     },
+    "bagebi": {
+        "label_ru": "Багеби",
+        "myhome_slug": "bagebi",
+        "ss_subdistrict_id": 44,
+        "aliases": ("bagebi", "ბაგები", "багеби"),
+    },
 }
 
 SOURCES = [
@@ -931,206 +937,248 @@ def whatsapp_link(phone: str) -> str:
     text = urllib.parse.quote(WHATSAPP_PREFILL_TEXT, safe="")
     return f"https://wa.me/{digits}?text={text}"
 
-async def extract_listing_phone(page: Any) -> str | None:
+async def extract_listing_phone(page: Any, site: str) -> str | None:
     """
-    Extract a Georgian mobile number from a listing detail page.
+    Extract ONLY the listing owner's/seller's Georgian mobile number.
 
-    Strategy:
-    1) inspect visible DOM, tel:/WhatsApp links, page text and embedded scripts
-    2) click likely phone/contact reveal controls
-    3) inspect network responses triggered by reveal clicks
+    Safety rule:
+    - Never accept the first mobile number found somewhere on the whole page.
+    - First isolate the visible owner/seller contact card.
+    - Read/click only inside that card.
+    - If the card cannot be identified confidently, return None rather than
+      create a WhatsApp button for a potentially unrelated number.
     """
 
-    network_values: list[str] = []
+    mobile_pattern = (
+        r"(?:\+?995[\s().-]*)?5\d{2}(?:[\s().-]*\d){6}"
+    )
 
-    def remember_network_response(response: Any) -> None:
-        async def collect() -> None:
-            try:
-                url = str(response.url or "")
-                if re.search(r"phone|contact|owner|seller|statement|listing|advert", url, re.I):
-                    network_values.append(url)
+    def normalize_candidates(values: list[str]) -> str | None:
+        for raw in values:
+            decoded = urllib.parse.unquote(str(raw or ""))
+            decoded = decoded.replace("\\u002B", "+").replace("\\/", "/")
+            for fragment in re.findall(mobile_pattern, decoded):
+                phone = normalize_georgian_mobile(fragment)
+                if phone:
+                    return phone
+        return None
 
-                content_type = (response.headers.get("content-type") or "").lower()
-                if not any(token in content_type for token in ("json", "text", "javascript")):
-                    return
+    # Site-specific labels. Both sites are searched in English in production,
+    # but KA/RU variants are included in case the site changes locale.
+    if site == "MyHome.ge":
+        marker_source = (
+            r"^(?:owner|მეპატრონე|владелец)$"
+        )
+    elif site == "SS.ge":
+        marker_source = (
+            r"^(?:owner|private\s+person|individual|seller|"
+            r"მეპატრონე|ფიზიკური\s+პირი|"
+            r"владелец|частное\s+лицо|продавец)$"
+        )
+    else:
+        return None
 
-                body = await response.text()
-                if body:
-                    network_values.append(body[:300_000])
-            except Exception:
-                return
-
+    async def mark_best_contact_card(frame: Any) -> bool:
         try:
-            asyncio.create_task(collect())
-        except Exception:
-            pass
-
-    page.on("response", remember_network_response)
-
-    async def collect_candidates() -> list[str]:
-        values: list[str] = []
-        for frame in page.frames:
-            try:
-                frame_values = await frame.evaluate(
+            return bool(
+                await frame.evaluate(
                     r"""
-                    () => {
-                      const values = [];
-                      const add = (value) => {
-                        if (value === null || value === undefined) return;
-                        const text = String(value).trim();
-                        if (text) values.push(text);
-                      };
+                    ({markerSource}) => {
+                      document.querySelectorAll('[data-owner-contact-card="1"]')
+                        .forEach((node) => node.removeAttribute('data-owner-contact-card'));
 
-                      for (const a of document.querySelectorAll('a[href]')) {
-                        add(a.getAttribute('href') || '');
-                        add(a.innerText || a.textContent || '');
-                      }
+                      const markerRe = new RegExp(markerSource, 'i');
+                      const clean = (value) =>
+                        String(value || '').replace(/\s+/g, ' ').trim();
 
-                      for (const node of document.querySelectorAll(
-                        '[data-phone],[data-mobile],[data-tel],[data-contact],' +
-                        '[aria-label],[title],[value]'
-                      )) {
-                        add(node.getAttribute('data-phone'));
-                        add(node.getAttribute('data-mobile'));
-                        add(node.getAttribute('data-tel'));
-                        add(node.getAttribute('data-contact'));
-                        add(node.getAttribute('aria-label'));
-                        add(node.getAttribute('title'));
-                        add(node.getAttribute('value'));
-                      }
+                      const phoneRe =
+                        /(?:\+?995[\s().-]*)?5\d{2}(?:[\s().-]*\d){6}/;
 
-                      add(document.body?.innerText || '');
+                      const contactHintRe =
+                        /phone|mobile|tel|contact|call|show.?number|whatsapp|ნომრ|ტელეფონ|მობილურ|დარეკ|დაკავშირ|номер|телефон|позвон|связат/i;
 
-                      for (const script of document.querySelectorAll('script')) {
-                        const text = script.textContent || '';
-                        if (
-                          /phone|mobile|tel|contact|owner|seller|whatsapp/i.test(text) ||
-                          /(?:\+?995[\s().-]*)?5\d{2}(?:[\s().-]*\d){6}/.test(text)
-                        ) {
-                          add(text.slice(0, 500000));
+                      const markers = Array.from(document.querySelectorAll('*'))
+                        .filter((el) => {
+                          const own = clean(el.textContent);
+                          if (!own || own.length > 60) return false;
+                          return markerRe.test(own);
+                        });
+
+                      let best = null;
+
+                      for (const marker of markers) {
+                        let node = marker;
+
+                        for (let depth = 0; depth < 8 && node; depth++, node = node.parentElement) {
+                          const text = clean(node.innerText || node.textContent);
+                          if (!text || text.length > 2600) continue;
+
+                          const controls = Array.from(
+                            node.querySelectorAll(
+                              'a[href],button,[role="button"],' +
+                              '[data-phone],[data-mobile],[data-tel],[data-contact],' +
+                              '[aria-label],[title]'
+                            )
+                          );
+
+                          const fingerprint = clean(
+                            controls.map((el) => [
+                              el.getAttribute('href') || '',
+                              el.getAttribute('aria-label') || '',
+                              el.getAttribute('title') || '',
+                              el.getAttribute('data-phone') || '',
+                              el.getAttribute('data-mobile') || '',
+                              el.getAttribute('data-tel') || '',
+                              el.getAttribute('data-contact') || '',
+                              el.innerText || el.textContent || ''
+                            ].join(' ')).join(' ')
+                          );
+
+                          const hasPhone = phoneRe.test(`${text} ${fingerprint}`);
+                          const hasContactControl = contactHintRe.test(fingerprint);
+
+                          if (!hasPhone && !hasContactControl) continue;
+
+                          // Prefer the smallest ancestor that contains the
+                          // owner label plus a phone/contact control.
+                          const score =
+                            text.length +
+                            depth * 120 -
+                            (hasPhone ? 800 : 0) -
+                            (hasContactControl ? 300 : 0);
+
+                          if (!best || score < best.score) {
+                            best = {node, score};
+                          }
                         }
                       }
 
-                      return values.slice(0, 700);
+                      if (!best) return false;
+                      best.node.setAttribute('data-owner-contact-card', '1');
+                      return true;
                     }
-                    """
+                    """,
+                    {"markerSource": marker_source},
                 )
-                values.extend(frame_values)
-            except Exception:
-                continue
-        values.extend(network_values[-150:])
-        return values
+            )
+        except Exception:
+            return False
 
-    def normalize_candidates(values: list[str]) -> str | None:
-        patterns = (
-            r"(?:\+?995[\s().-]*)?5\d{2}(?:[\s().-]*\d){6}",
-            r"(?:00995[\s().-]*)5\d{2}(?:[\s().-]*\d){6}",
-        )
-        for raw in values:
-            decoded = urllib.parse.unquote(str(raw))
-            for pattern in patterns:
-                for fragment in re.findall(pattern, decoded):
-                    phone = normalize_georgian_mobile(fragment)
-                    if phone:
-                        return phone
-        return None
+    async def values_from_marked_card(frame: Any) -> list[str]:
+        try:
+            return await frame.evaluate(
+                r"""
+                () => {
+                  const card =
+                    document.querySelector('[data-owner-contact-card="1"]');
+                  if (!card) return [];
 
-    phone = normalize_candidates(await collect_candidates())
-    if phone:
-        return phone
+                  const out = [];
+                  const add = (value) => {
+                    const text = String(value || '').trim();
+                    if (text) out.push(text);
+                  };
 
-    reveal_patterns = (
-        re.compile(r"show\s+(?:phone|number)", re.I),
-        re.compile(r"phone\s*number", re.I),
-        re.compile(r"contact\s+(?:owner|seller)", re.I),
-        re.compile(r"call\s+(?:owner|seller)", re.I),
-        re.compile(r"ნომრ.*ჩვენებ", re.I),
-        re.compile(r"ტელეფონ", re.I),
-        re.compile(r"მობილურ", re.I),
-        re.compile(r"დაკავშირ", re.I),
-        re.compile(r"პატრონ", re.I),
-        re.compile(r"показать\s+номер", re.I),
-        re.compile(r"номер\s+телефона", re.I),
-        re.compile(r"телефон", re.I),
-        re.compile(r"позвон", re.I),
-        re.compile(r"связат", re.I),
-    )
+                  add(card.innerText || card.textContent || '');
 
+                  for (const el of card.querySelectorAll(
+                    'a[href],[data-phone],[data-mobile],[data-tel],[data-contact],' +
+                    '[aria-label],[title],[value]'
+                  )) {
+                    add(el.getAttribute('href'));
+                    add(el.getAttribute('data-phone'));
+                    add(el.getAttribute('data-mobile'));
+                    add(el.getAttribute('data-tel'));
+                    add(el.getAttribute('data-contact'));
+                    add(el.getAttribute('aria-label'));
+                    add(el.getAttribute('title'));
+                    add(el.getAttribute('value'));
+                    add(el.innerText || el.textContent || '');
+                  }
+
+                  return out.slice(0, 250);
+                }
+                """
+            )
+        except Exception:
+            return []
+
+    async def read_marked_card_phone(frame: Any) -> str | None:
+        return normalize_candidates(await values_from_marked_card(frame))
+
+    # Mark and inspect contact cards in all frames.
+    marked_frames: list[Any] = []
     for frame in page.frames:
-        for pattern in reveal_patterns:
-            try:
-                controls = frame.get_by_text(pattern)
-                for index in range(min(await controls.count(), 10)):
-                    control = controls.nth(index)
-                    if not await control.is_visible():
-                        continue
-                    try:
-                        await control.click(timeout=4_000)
-                        await page.wait_for_timeout(1_500)
-                    except Exception:
-                        continue
-                    phone = normalize_candidates(await collect_candidates())
-                    if phone:
-                        return phone
-            except Exception:
-                continue
+        if await mark_best_contact_card(frame):
+            marked_frames.append(frame)
+            phone = await read_marked_card_phone(frame)
+            if phone:
+                return phone
 
-    for frame in page.frames:
+    # If the phone is masked, click ONLY controls inside the already-isolated
+    # owner/seller card, never arbitrary phone-looking controls on the page.
+    for frame in marked_frames:
         try:
             controls = frame.locator(
-                "button, [role='button'], a, [class*='phone'], [class*='mobile'], "
-                "[class*='contact'], [class*='call'], [class*='tel'], "
-                "[data-testid*='phone'], [data-testid*='contact']"
+                '[data-owner-contact-card="1"] '
+                'a[href], '
+                '[data-owner-contact-card="1"] button, '
+                '[data-owner-contact-card="1"] [role="button"], '
+                '[data-owner-contact-card="1"] [class*="phone" i], '
+                '[data-owner-contact-card="1"] [class*="contact" i], '
+                '[data-owner-contact-card="1"] [class*="call" i], '
+                '[data-owner-contact-card="1"] [class*="tel" i]'
             )
-            count = min(await controls.count(), 180)
-
-            for index in range(count):
-                control = controls.nth(index)
-                try:
-                    if not await control.is_visible():
-                        continue
-
-                    fingerprint = await control.evaluate(
-                        r"""
-                        (el) => [
-                          el.innerText || '',
-                          el.textContent || '',
-                          el.getAttribute('aria-label') || '',
-                          el.getAttribute('title') || '',
-                          el.getAttribute('class') || '',
-                          el.getAttribute('data-testid') || '',
-                          el.getAttribute('href') || '',
-                          el.innerHTML || ''
-                        ].join(' ').slice(0, 6000)
-                        """
-                    )
-
-                    if not re.search(
-                        r"phone|mobile|tel|contact|call|owner|seller|whatsapp|"
-                        r"ტელეფონ|მობილურ|ნომერ|დაკავშირ|დარეკ|მეპატრონ|პატრონ|"
-                        r"телефон|номер|позвон|связат",
-                        fingerprint,
-                        re.I,
-                    ):
-                        continue
-
-                    try:
-                        await control.click(timeout=3_000)
-                        await page.wait_for_timeout(1_500)
-                    except Exception:
-                        continue
-
-                    phone = normalize_candidates(await collect_candidates())
-                    if phone:
-                        return phone
-
-                except Exception:
-                    continue
+            count = min(await controls.count(), 40)
         except Exception:
             continue
 
-    await page.wait_for_timeout(1_000)
-    return normalize_candidates(await collect_candidates())
+        for index in range(count):
+            control = controls.nth(index)
+            try:
+                if not await control.is_visible():
+                    continue
+
+                fingerprint = await control.evaluate(
+                    r"""
+                    (el) => [
+                      el.innerText || '',
+                      el.textContent || '',
+                      el.getAttribute('href') || '',
+                      el.getAttribute('aria-label') || '',
+                      el.getAttribute('title') || '',
+                      el.getAttribute('class') || ''
+                    ].join(' ').slice(0, 3000)
+                    """
+                )
+
+                if not re.search(
+                    r"phone|mobile|tel|contact|call|show.?number|whatsapp|"
+                    r"ნომრ|ტელეფონ|მობილურ|დარეკ|დაკავშირ|"
+                    r"номер|телефон|позвон|связат|"
+                    r"\*{2,}",
+                    fingerprint,
+                    re.I,
+                ):
+                    continue
+
+                try:
+                    await control.click(timeout=3_500)
+                except Exception:
+                    continue
+
+                await page.wait_for_timeout(1_200)
+
+                # Re-mark in case the framework replaced the contact card.
+                if await mark_best_contact_card(frame):
+                    phone = await read_marked_card_phone(frame)
+                    if phone:
+                        return phone
+            except Exception:
+                continue
+
+    # Fail closed: no generic page-wide phone fallback.
+    return None
 
 
 async def enrich_new_listings(items: list[dict[str, Any]]) -> None:
@@ -1175,7 +1223,7 @@ async def enrich_new_listings(items: list[dict[str, Any]]) -> None:
 
                 if not item.get("manual_search"):
                     try:
-                        item["phone"] = await extract_listing_phone(page)
+                        item["phone"] = await extract_listing_phone(page, str(item.get("site") or ""))
                         if item.get("phone"):
                             print(f"OWNER_PHONE {item['site']} {item['listing_id']}: {item['phone']}")
                         else:
