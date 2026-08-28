@@ -26,6 +26,7 @@ import check_once
 DISTRICTS = {
     "vake": ("Ваке", "vake", "47", {"vake"}),
     "saburtalo": ("Сабуртало", "saburtalo", "3", {"saburtalo"}),
+    "bagebi": ("Багеби", "bagebi", "44", {"bagebi"}),
     "vashlijvari": ("Вашлиджвари", "vashlijvari", "48", {"vashlijvari", "vaslidzvari"}),
     "lisi": ("Лиси", "lisi", "3", {"lisi", "lisi-lake"}),
     "nutsubidze": ("Плато Нуцубидзе", "nucubidzis-perdobi", "3", {"nutsubidze", "nutsubidze-plateau", "nucubidze", "nucubidze-plateau", "nucubidzis-perdobi"}),
